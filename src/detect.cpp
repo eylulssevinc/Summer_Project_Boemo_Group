@@ -853,7 +853,6 @@ int detect_main( int argc, char** argv ){
 			for (unsigned int i = 0; i < buffer.size(); i++){
 
 				DNAscent::read r(buffer[i], bam_hdr, readID2path, reference);
-
 				if (r.missing){
 
 					std::lock_guard<std::mutex> lock(mtx);

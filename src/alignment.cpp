@@ -547,6 +547,8 @@ bool referenceDefined(std::string &readSnippet){
 void eventalign( DNAscent::read &r, unsigned int totalWindowLength){
 
 	int readHead = 0;
+	int runningInsertions = 0;
+	int runningDeletions = 0;
 
 	unsigned int k = Pore_Substrate_Config.kmer_len;
 
@@ -555,10 +557,17 @@ void eventalign( DNAscent::read &r, unsigned int totalWindowLength){
 	unsigned int reference_index = 0;
 	while ( reference_index < r.referenceSeqMappedTo.size() - k + 1){
 
-		//adjust so we can get the last bit of the read if it doesn't line up with the windows nicely
-		unsigned int basesToEnd = r.referenceSeqMappedTo.size() - reference_index ;
-		unsigned int windowLength = std::min(basesToEnd, totalWindowLength);
+		double insRate = (runningInsertions) / double(readHead+1);
+		double delRate = (runningDeletions) / double(reference_index+1);
+		if (insRate > 0.2){
+			r.QCpassed = false;
+			return;
+		}
 
+		//adjust so we can get the last bit of the read if it doesn't line up with the windows nicely
+		unsigned int basesToEnd = r.referenceSeqMappedTo.size() - reference_index;
+		unsigned int windowLength = std::min(basesToEnd, totalWindowLength);
+	
 		//find good breakpoints
 		std::string break1, break2;
 		if (basesToEnd > 1.5*totalWindowLength){
@@ -630,7 +639,7 @@ void eventalign( DNAscent::read &r, unsigned int totalWindowLength){
 			//stop once we get to the end of the window
 			if ( (r.eventAlignment)[j].second >= (r.refToQuery)[reference_index + windowLength - k + 1] ) break;
 		}
-		
+	
 		//flag large insertions
 		int querySpan = (r.refToQuery)[reference_index + windowLength - k + 1] - (r.refToQuery)[reference_index];
 		assert(querySpan >= 0);
@@ -648,7 +657,7 @@ void eventalign( DNAscent::read &r, unsigned int totalWindowLength){
 		int reference_coord;
 		if ( r.isReverse ) reference_coord = r.refEnd - reference_index - k/2;
 		else reference_coord = r.refStart + reference_index + k/2;
-		
+		//std::cout << "Event sizes: " << eventSnippet_means.size() << " " << eventSnippet.size() << std::endl;
 		std::pair< double, std::vector<std::string> > builtinAlignment = builtinViterbi( eventSnippet_means, readSnippet, r.scalings, false);
 
 		std::vector< std::string > stateLabels = builtinAlignment.second;
@@ -676,9 +685,13 @@ void eventalign( DNAscent::read &r, unsigned int totalWindowLength){
 		for (size_t i = 0; i < stateLabels.size(); i++){
 
 			std::string label = stateLabels[i].substr(stateLabels[i].find('_')+1);
-	        	int pos = std::stoi(stateLabels[i].substr(0,stateLabels[i].find('_')));
+	        int pos = std::stoi(stateLabels[i].substr(0,stateLabels[i].find('_')));
 
-			if (label == "D") continue; //silent states don't emit an event
+			//silent states don't emit an event
+			if (label == "D"){
+				runningDeletions++;
+				continue;
+			}
 
 			std::string kmerStrand = (r.referenceSeqMappedTo).substr(reference_index + pos, k);
 
@@ -702,7 +715,9 @@ void eventalign( DNAscent::read &r, unsigned int totalWindowLength){
 				std::pair<double,double> meanStd = Pore_Substrate_Config.pore_model[kmer2index(kmerStrand, k)];
 
 				for (unsigned int idx_raw = 0; idx_raw < eventSnippet[evIdx].raw.size(); idx_raw++){
+					//std::cout << evIdx << " " << eventSnippet.size() << " " << idx_raw << " " << eventSnippet[evIdx].raw.size() << std::endl;
 					double scaledEvent = (eventSnippet[evIdx].raw[idx_raw] - r.scalings.shift) / r.scalings.scale;
+
 					if (r.refCoordToCalls.count(event_coord) > 0){
 						r.humanReadable_eventalignOut += std::to_string(event_coord) 
 							      + "\t" + kmerRef 
@@ -722,6 +737,7 @@ void eventalign( DNAscent::read &r, unsigned int totalWindowLength){
 							      + "\n";
 						r.addSignal(kmerStrand, event_coord, event_indexQuery, event_indexRef, scaledEvent, indelScore);
 					}
+
 				}
 
 			}
@@ -730,6 +746,7 @@ void eventalign( DNAscent::read &r, unsigned int totalWindowLength){
 					double scaledEvent = (eventSnippet[evIdx].raw[idx_raw] - r.scalings.shift) / r.scalings.scale;
 					r.humanReadable_eventalignOut += std::to_string(event_coord) + "\t" + kmerRef + "\t" + std::to_string(scaledEvent) + "\t" + std::string(k, 'N') + "\t" + "0" + "\n";
 				}
+				runningInsertions++;
 			}
 			
 			evIdx ++;
@@ -739,7 +756,7 @@ void eventalign( DNAscent::read &r, unsigned int totalWindowLength){
 		readHead += lastM_ev + 1;
 		reference_index += lastM_ref + 1;
 	}
-	
+
 	r.QCpassed = true;
 }
 
@@ -800,6 +817,9 @@ int align_main( int argc, char** argv ){
 	bam1_t *itr_record = bam_init1();
 	int result = sam_read1(bam_fh, bam_hdr, itr_record);
 
+	//int readCount = 0;
+
+
 	while(result >= 0){
 	
 		bam1_t *record = bam_dup1(itr_record);
@@ -819,7 +839,7 @@ int align_main( int argc, char** argv ){
 		}
 
 		result = sam_read1(bam_fh, bam_hdr, itr_record);
-
+				
 		//if we've filled up the buffer with reads, compute them in parallel
 		if (buffer.size() >= maxBufferSize or (buffer.size() > 0 and result == -1 ) ){
 

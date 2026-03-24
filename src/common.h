@@ -9,7 +9,7 @@
 #ifndef COMMON_H
 #define COMMON_H
 
-#define VERSION "4.1.1"
+#define VERSION "4.2.0"
 
 #include <algorithm>
 #include <vector>
@@ -216,6 +216,17 @@ double vectorSum(const std::vector<T>& obs) {
         total += static_cast<double>(val);
     }
     return total;
+}
+
+template <typename T>
+inline double vectorMedian(std::vector<T> v) {
+	static_assert(std::is_arithmetic<T>::value, "vectorMedian requires a numeric type");
+
+	if (v.empty()) return 0.0;
+	std::sort(v.begin(), v.end());
+	size_t n = v.size();
+	if (n % 2 == 1) return static_cast<double>(v[n / 2]);
+	return (static_cast<double>(v[n / 2 - 1]) + static_cast<double>(v[n / 2])) / 2.0;
 }
 
 

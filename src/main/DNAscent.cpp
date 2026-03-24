@@ -18,6 +18,7 @@
 #include "../trainGMM.h"
 #include "../config.h"
 #include "../seeBreaks.h"
+#include "../iod.h"
 
 
 int show_options_DNAscent( int, char** );
@@ -31,6 +32,7 @@ static std::map< std::string, std::function< int( int, char** ) > > executables 
 	{"seeBreaks", seeBreaks_main},
 	{"trainCNN", 	data_main},
 	{"trainGMM", 	train_main},
+	{"iod", 		iod_main},
 	{"--help",	show_options_DNAscent},
 	{"-h",		show_options_DNAscent},
 	{"-v",		show_version},

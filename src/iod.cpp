@@ -39,7 +39,7 @@
 #include "htsInterface.h"
 #include "iod.h"
 
-#define CHR_LEN 2000 // Assumes reads of longer than 1 Mb are fleetingly rare and can be ignored for the purposes of IOD estimation
+#define CHR_LEN 1000 // Assumes reads of longer than 1 Mb are fleetingly rare and can be ignored for the purposes of IOD estimation
 
 
 static const char *help=
@@ -52,14 +52,17 @@ static const char *help=
 "     --origin               path to origin file from forkSense detect with `bed` extension,\n"
 "     --termination          path to termination file from forkSense detect with `bed` extension,\n"
 "  -d,--detect               path to output from detect with `detect` or `bam` extension,\n"
+"     --tPulse1              duration (in minutes) of the first analogue pulse,\n"
+"     --tPulse2              duration (in minutes) of the second analogue pulse,\n"
 "  -o,--output               path to output file or directory for IOD.\n"
 "Optional arguments are:\n"
 "  -t,--threads              number of threads (default is 1 thread),\n"
+"     --makePlots            generate tsv for diagnostic plots (default is false).\n"
 "DNAscent is under active development by the Boemo Group, Department of Pathology, University of Cambridge (https://www.boemogroup.org/).\n"
 "Please submit bug reports to GitHub Issues (https://github.com/MBoemo/DNAscent/issues).";
 
 
-double wassersteinDistance(std::vector<int> a, std::vector<int> b) {
+double wassersteinDistance(std::vector<double> a, std::vector<double> b) {
 
 	std::sort(a.begin(), a.end());
 	std::sort(b.begin(), b.end());
@@ -143,7 +146,12 @@ struct Arguments {
     bool humanReadable = false;
 	bool specifiedOutput = false;
     bool specifiedDetect = false;
+	bool specifiedPulse1 = false;
+	bool specifiedPulse2 = false;
 	int threads = 1;
+	double EdUpulseLength; // in minutes
+	double BrdUpulseLength; // in minutes
+	bool makePlots = false;
 };
 
 
@@ -216,6 +224,21 @@ Arguments parseIODArguments( int argc, char** argv ) {
 			i+=2;
 			args.specifiedTermination = true;
         }
+		else if ( flag == "--tPulse1" ){
+
+			if (i == argc-1) throw TrailingFlag(flag);
+			std::string strArg( argv[ i + 1 ] );
+			args.EdUpulseLength = std::stod(strArg);
+			i += 2; // Skip the flag and its argument
+            args.specifiedPulse1 = true;
+        }
+        else if ( flag == "--tPulse2" ){
+			if (i == argc-1) throw TrailingFlag(flag);
+			std::string strArg( argv[ i + 1 ] );
+			args.BrdUpulseLength = std::stod(strArg);
+			i += 2; // Skip the flag and its argument
+            args.specifiedPulse2 = true;
+        }
         else if ( flag == "-h" or flag == "--help" ){
             std::cout << help << std::endl;
             exit(EXIT_SUCCESS);
@@ -258,9 +281,13 @@ Arguments parseIODArguments( int argc, char** argv ) {
 			args.threads = std::stoi(strArg);
 			i += 2; // Skip the flag and its argument
 		}
+        else if (flag == "--makePlots") {
+            args.makePlots = true;
+            i += 1; // Skip the flag
+        }
         else throw InvalidOption( flag );
 	}
-    if ( !args.specifiedOutput or !args.specifiedOrigin or !args.specifiedTermination or !args.specifiedDetect or (!args.specifiedLeft and !args.specifiedRight) ) {
+    if ( !args.specifiedOutput or !args.specifiedPulse1 or !args.specifiedPulse2 or !args.specifiedOrigin or !args.specifiedTermination or !args.specifiedDetect or (!args.specifiedLeft and !args.specifiedRight) ) {
         std::cout << "Exiting with error.  Insufficient arguments passed to DNAscent IOD." << std::endl;
         exit(EXIT_FAILURE);
     }
@@ -411,7 +438,7 @@ std::pair<std::vector<ForkCall>, std::vector<ForkCall>> parseForkCalls(
 		int EdULength = (eduStart != -1 && eduEnd != -1) ? std::abs(eduEnd - eduStart + 1) : 0;
 		int BrdULength = (brduStart != -1 && brduEnd != -1) ? std::abs(brduEnd - brduStart + 1) : 0;
 
-		if (eduStart != -1 && brduStart != -1 && EdULength > 2 && BrdULength > 2) {
+		if (eduStart != -1 && brduStart != -1 && EdULength >= 2 && BrdULength >= 2) {
 			ForkCall call;
 			call.EdU_start = eduStart;
 			call.EdU_end = eduEnd;
@@ -458,7 +485,7 @@ std::pair<std::vector<ForkCall>, std::vector<ForkCall>> parseForkCalls(
 		int EdULength = (eduStart != -1 && eduEnd != -1) ? std::abs(eduEnd - eduStart + 1) : 0;
 		int BrdULength = (brduStart != -1 && brduEnd != -1) ? std::abs(brduEnd - brduStart + 1) : 0;
 
-		if (eduStart != -1 && brduStart != -1 && EdULength > 2 && BrdULength > 2) {
+		if (eduStart != -1 && brduStart != -1 && EdULength >= 2 && BrdULength >= 2) {
 			ForkCall call;
 			call.EdU_start = eduStart;
 			call.EdU_end = eduEnd;
@@ -501,11 +528,8 @@ std::vector<MatchedForkPair> matchForkCalls(
 }
 
 
-std::vector<int> runPulseChase(SimulationResult &result, std::mt19937 &gen, std::vector<int> &readLengths) {
+std::vector<double> runPulseChase(SimulationResult &result, std::mt19937 &gen, std::vector<int> &readLengths, double EdUpulseTime, double BrdUpulseTime) {
 
-	double EdUpulseTime = 5.0; // Time of EdU pulse in minutes
-	double BrdUpulseTime = 10.0; // Time of BrdU pulse in minutes
-	
 	if (result.completionTime <= EdUpulseTime + BrdUpulseTime) return {};
 	std::uniform_real_distribution<double> uniform(0.0, result.completionTime - EdUpulseTime - BrdUpulseTime);
 	double pulseStart = uniform(gen);
@@ -526,13 +550,15 @@ std::vector<int> runPulseChase(SimulationResult &result, std::mt19937 &gen, std:
 	auto forkCalls = parseForkCalls(result, pulseStart, EdUpulseEnd, pulseEnd, readStart, readEnd);
 	auto matchedPairs = matchForkCalls(forkCalls.first, forkCalls.second);
 
-	std::vector<int> forkDistanceTravelled;
+	std::vector<double> forkDistanceTravelled;
 	for (const auto &pair : matchedPairs) {
 
 		// Approximate the origin as the midpoint between EdU start sites, as DNAscent would do
-		int originPos = pair.leftFork.EdU_start + (pair.rightFork.EdU_start - pair.leftFork.EdU_start)/2;
+		int originPos = (pair.rightFork.EdU_start + pair.leftFork.EdU_start)/2;
 		int leftDistance = originPos - pair.leftFork.BrdU_end;
+		assert(leftDistance >= 0); // left fork should be left of origin
 		int rightDistance = pair.rightFork.BrdU_end - originPos;
+		assert(rightDistance >= 0); // right fork should be right of origin
 
 		forkDistanceTravelled.push_back(std::max(leftDistance, rightDistance));
 	}
@@ -613,7 +639,7 @@ void getIgnoreIDs(std::string fileInput, std::vector<std::string> &ignoreIDs) {
 }
 
 
-std::vector<int> calcOriginForkDistances(
+std::vector<double> calcOriginForkDistances(
 	const std::string &originFile,
 	const std::string &leftForkFile,
 	const std::string &rightForkFile) {
@@ -651,8 +677,10 @@ std::vector<int> calcOriginForkDistances(
 			if (!line.empty() && line[0] != '#') {
 				std::vector<std::string> columns = split(line);
 				std::string readID = columns[3];
-				int tip = std::stoi(columns[1]); // start = leading edge for left fork
-				leftForkTips[readID].push_back(tip);
+				int pulse5Prime = std::stoi(columns[1]);
+                int read5Prime = std::stoi(columns[4]);
+				if (std::abs(pulse5Prime - read5Prime) == 0) continue; // ignore forks near the end of the read
+				leftForkTips[readID].push_back(pulse5Prime);
 			}
 		}
 	}
@@ -670,14 +698,16 @@ std::vector<int> calcOriginForkDistances(
 			if (!line.empty() && line[0] != '#') {
 				std::vector<std::string> columns = split(line);
 				std::string readID = columns[3];
-				int tip = std::stoi(columns[2]); // end = leading edge for right fork
-				rightForkTips[readID].push_back(tip);
+                int pulse3Prime = std::stoi(columns[2]);
+                int read3Prime = std::stoi(columns[5]);
+				if (std::abs(read3Prime - pulse3Prime) == 0) continue; 
+				rightForkTips[readID].push_back(pulse3Prime);
 			}
 		}
 	}
 
 	// For each origin, calculate distance to the nearest fork tip
-	std::vector<int> distances;
+	std::vector<double> distances;
 	for (const auto &origin : originMidpoints) {
 		const std::string &readID = origin.first;
 		int midpoint = origin.second;
@@ -703,7 +733,7 @@ std::vector<int> calcOriginForkDistances(
 		}
 
 		// Take the tip of the fork that was furthest away from the midpoint
-		distances.push_back((std::max(minLeftDist, minRightDist))/1000.); // convert to kb
+		distances.push_back(static_cast<double>(std::max(minLeftDist, minRightDist))/1000.0); // convert to kb
 	}
 
 	return distances;
@@ -777,11 +807,11 @@ int iod_main(int argc, char** argv) {
 	std::vector<double> forkLengths = parseForkBed(args.lForkInput, ignoreIDs);
 	std::vector<double> rightForkLengths = parseForkBed(args.rForkInput, ignoreIDs);
 	forkLengths.insert(forkLengths.end(), rightForkLengths.begin(), rightForkLengths.end());
-	double avgForkSpeed = vectorMean(forkLengths) / 15.; // convert to kb/min
+	double avgForkSpeed = vectorMean(forkLengths) / (args.EdUpulseLength + args.BrdUpulseLength); // convert to kb/min
 	std::cout << "Mean fork speed = " << std::fixed << std::setprecision(3) << avgForkSpeed << " kb/min" << std::endl;
 
 	// Calculate distance between fork tip and DNAscent origin call
-	std::vector<int> data_originForkDistances = calcOriginForkDistances(args.originInput, args.lForkInput, args.rForkInput);
+	std::vector<double> data_originForkDistances = calcOriginForkDistances(args.originInput, args.lForkInput, args.rForkInput);
 
     // Parse detect output
     std::vector<int> readLengths;
@@ -795,13 +825,13 @@ int iod_main(int argc, char** argv) {
         bamReadlength(args.DetectInput, readLengths);       
     }
 
-	int nSims = 100000; 
+	int nSims = 50000; 
 	unsigned int seed = 42;
 
 	// Objective function: run simulations at a given fr and return Wasserstein distance to data
 	// Also computes the median IOD for that firing rate
 	auto objective = [&](double fr, double &medianIOD) -> double {
-		std::vector<int> sim_originForkDistances;
+		std::vector<double> sim_originForkDistances;
 		std::vector<int> sim_IODs;
 
 		#pragma omp parallel for num_threads(args.threads) schedule(dynamic)
@@ -809,12 +839,12 @@ int iod_main(int argc, char** argv) {
 
 			std::mt19937 gen(seed + sim);
 			SimulationResult result = runGillespie(CHR_LEN, avgForkSpeed, fr, gen);
-			std::vector<int> OriginForkDistances;
+			std::vector<double> OriginForkDistances;
 			std::vector<int> iods;
 			
 			for (size_t i = 0; i < 100; i++){
 			
-				std::vector<int> distances = runPulseChase(result, gen, readLengths);
+				std::vector<double> distances = runPulseChase(result, gen, readLengths, args.EdUpulseLength, args.BrdUpulseLength);
 				OriginForkDistances.insert(OriginForkDistances.end(), distances.begin(), distances.end());
 
 				// Compute IODs from fired origin positions
@@ -836,62 +866,95 @@ int iod_main(int argc, char** argv) {
 	};
 
 	// Golden section search to find fr that minimises Wasserstein distance
-	double frLow = 1e-7;
-	double frHigh = 1e-3;
+	// Search in log10(fr) space so that probe points are evenly distributed
+	// across orders of magnitude
+	double frLow = 1e-5;
+	double frHigh = 1e-2;
+	double logFrLow = std::log10(frLow);
+	double logFrHigh = std::log10(frHigh);
 	double tol = 1e-7;
+	double logTol = std::log10((frLow + tol) / frLow); // tolerance in log-space
+
+	// Scan the objective landscape and write to file for plotting
+	if (args.makePlots) {
+		std::vector<double> scanFrValues;
+		double multipliers[] = {1., 2., 4., 6., 8.};
+		for (double decade = frLow; decade < frHigh; decade *= 10.0) {
+			for (double m : multipliers) {
+				double val = decade * m;
+				if (val >= frLow && val <= frHigh) scanFrValues.push_back(val);
+			}
+		}
+		if (scanFrValues.empty() || scanFrValues.back() < frHigh) scanFrValues.push_back(frHigh);
+		int nScanPoints = scanFrValues.size();
+		std::ofstream landscapeFile(args.output + "_landscape.tsv");
+		landscapeFile << "fr\tIOD\tWasserstein" << std::endl;
+		std::cerr << "Scanning objective landscape (" << nScanPoints << " points)..." << std::endl;
+		for (int s = 0; s < nScanPoints; s++) {
+			double fr = scanFrValues[s];
+			double scanIOD;
+			double scanW = objective(fr, scanIOD);
+			landscapeFile << std::scientific << std::setprecision(6) << fr << "\t"
+						<< std::fixed << std::setprecision(1) << scanIOD << "\t"
+						<< std::fixed << std::setprecision(4) << scanW << std::endl;
+			std::cerr << "\r  [" << s + 1 << "/" << nScanPoints << "]" << std::flush;
+		}
+		landscapeFile.close();
+		std::cerr << std::endl << "Landscape written to " << args.output + "_landscape.tsv" << std::endl;
+	}
 	const double invPhi = (std::sqrt(5.0) - 1.0) / 2.0; // ~0.618
 
-	double x1 = frHigh - invPhi * (frHigh - frLow);
-	double x2 = frLow + invPhi * (frHigh - frLow);
+	double lx1 = logFrHigh - invPhi * (logFrHigh - logFrLow);
+	double lx2 = logFrLow + invPhi * (logFrHigh - logFrLow);
 	double iod1, iod2;
-	double f1 = objective(x1, iod1);
-	double f2 = objective(x2, iod2);
+	double f1 = objective(std::pow(10.0, lx1), iod1);
+	double f2 = objective(std::pow(10.0, lx2), iod2);
 
 	std::cerr << "Starting parameter search for optimal firing rate in [" << frLow << ", " << frHigh << "]..." << std::endl;
 
 	int iteration = 1;
-	while ((frHigh - frLow) > tol) {
+	while ((logFrHigh - logFrLow) > logTol) {
 
 		if (f1 < f2) {
-			frHigh = x2;
-			x2 = x1;
+			logFrHigh = lx2;
+			lx2 = lx1;
 			f2 = f1;
 			iod2 = iod1;
-			x1 = frHigh - invPhi * (frHigh - frLow);
-			f1 = objective(x1, iod1);
+			lx1 = logFrHigh - invPhi * (logFrHigh - logFrLow);
+			f1 = objective(std::pow(10.0, lx1), iod1);
 		} else {
-			frLow = x1;
-			x1 = x2;
+			logFrLow = lx1;
+			lx1 = lx2;
 			f1 = f2;
 			iod1 = iod2;
-			x2 = frLow + invPhi * (frHigh - frLow);
-			f2 = objective(x2, iod2);
+			lx2 = logFrLow + invPhi * (logFrHigh - logFrLow);
+			f2 = objective(std::pow(10.0, lx2), iod2);
 		}
 
-		double bestFr = (x1 + x2) / 2.0;  // or use the point with better objective value
+		double bestFr = std::pow(10.0, (lx1 + lx2) / 2.0);
 		double bestIOD = (f1 < f2) ? iod1 : iod2;
 		std::cerr << "[Iteration " << std::setw(2) << iteration << "] "
 				  << "fr = " << std::scientific << std::setprecision(3) << std::setw(9) << bestFr
-				  << "  bracket = [" << std::setw(9) << frLow << ", " << std::setw(9) << frHigh << "]"
+				  << "  bracket = [" << std::setw(9) << std::pow(10.0, logFrLow) << ", " << std::setw(9) << std::pow(10.0, logFrHigh) << "]"
 				  << "  IOD = " << std::fixed << std::setw(3) << std::setprecision(0) << bestIOD
 				  << "  W = " << std::fixed << std::setprecision(3) << std::setw(5) << std::min(f1, f2) << std::endl;
 		iteration++;
 	}
 
-	double bestFr = (frLow + frHigh) / 2.0;
+	double bestFr = std::pow(10.0, (logFrLow + logFrHigh) / 2.0);
 	double bestW = std::min(f1, f2);
 	double bestIOD = (f1 < f2) ? iod1 : iod2;
 
 	// Estimate uncertainty via local curvature of the objective
-	// Evaluate at three points around the optimum to get curvature in fr-space,
+	// Evaluate at three points around the optimum in log-space,
 	// then convert uncertainty to IOD-space using the IOD values at those points
-	double h = bestFr * 0.05; // 5% step for finite differences
+	double logBestFr = std::log10(bestFr);
+	double logH = 0.05; // step in log10(fr) space
 	double iodLeft, iodCentre, iodRight;
-	double fLeft = objective(bestFr - h, iodLeft);
+	double fLeft = objective(std::pow(10.0, logBestFr - logH), iodLeft);
 	double fCentre = objective(bestFr, iodCentre);
-	double fRight = objective(bestFr + h, iodRight);
-	double curvature = (fLeft - 2.0 * fCentre + fRight) / (h * h);
-
+	double fRight = objective(std::pow(10.0, logBestFr + logH), iodRight);
+	double curvature = (fLeft - 2.0 * fCentre + fRight) / (logH * logH);
 
 	std::cerr << "Parameter search complete." << std::endl << std::endl;
 	std::cerr << "Summary:" << std::endl;
@@ -901,12 +964,12 @@ int iod_main(int argc, char** argv) {
 	std::cerr << "Median IOD = " << std::fixed << std::setprecision(0) << bestIOD << " kb" << std::endl;
 
 	if (curvature > 0) {
-		// Uncertainty in fr-space
-		double frUncertainty = 1.96 / std::sqrt(curvature);
+		// Uncertainty in log10(fr)-space
+		double logFrUncertainty = 1.96 / std::sqrt(curvature);
 
-		// Convert fr uncertainty to IOD uncertainty using dIOD/dfr estimated from the three evaluation points
-		double dIOD_dfr = (iodRight - iodLeft) / (2.0 * h);
-		double iodUncertainty = std::abs(dIOD_dfr) * frUncertainty;
+		// Convert log10(fr) uncertainty to IOD uncertainty using dIOD/dlog10(fr)
+		double dIOD_dlogFr = (iodRight - iodLeft) / (2.0 * logH);
+		double iodUncertainty = std::abs(dIOD_dlogFr) * logFrUncertainty;
 
 		std::cerr << "Curvature at minimum: " << std::scientific << std::setprecision(3) << curvature << std::endl;
 		std::cerr << "95% confidence interval: [" << std::fixed << std::setprecision(0) << bestIOD - iodUncertainty << " kb , " << std::fixed << std::setprecision(0) << bestIOD + iodUncertainty << " kb]" << std::endl;

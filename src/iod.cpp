@@ -34,7 +34,10 @@
 #include <cstring>
 #include <fstream>
 #include <numeric>
+#include <sstream>
+#include <ctime>
 #include "common.h"
+#include "data_IO.h"
 #include "error_handling.h"
 #include "htsInterface.h"
 #include "iod.h"
@@ -56,16 +59,57 @@ static const char *help=
 "     --tPulse2              duration (in minutes) of the second analogue pulse,\n"
 "  -o,--output               path to output file or directory for IOD.\n"
 "Optional arguments are:\n"
-"  -t,--threads              number of threads (default is 1 thread),\n"
-"     --makePlots            generate tsv for diagnostic plots (default is false).\n"
+"  -t,--threads              number of threads (default is 1 thread).\n"
 "DNAscent is under active development by the Boemo Group, Department of Pathology, University of Cambridge (https://www.boemogroup.org/).\n"
 "Please submit bug reports to GitHub Issues (https://github.com/MBoemo/DNAscent/issues).";
 
 
-double wassersteinDistance(std::vector<double> a, std::vector<double> b) {
+double wasserstein(std::vector<double> a, std::vector<double> b) {
 
 	std::sort(a.begin(), a.end());
 	std::sort(b.begin(), b.end());
+
+	size_t n = a.size();
+	size_t m = b.size();
+
+	// 1-Wasserstein distance: integral of |F_a(x) - F_b(x)| dx
+	double totalDist = 0.0;
+	size_t i = 0, j = 0;
+	double prevCDF_a = 0.0, prevCDF_b = 0.0;
+	double prevVal = 0.0;
+	bool first = true;
+
+	while (i < n || j < m) {
+
+		double val;
+		if (i < n && (j >= m || a[i] <= b[j])) {
+			val = a[i];
+		} else {
+			val = b[j];
+		}
+
+		if (!first) {
+			double diff = prevCDF_a - prevCDF_b;
+			totalDist += std::abs(diff) * (val - prevVal);
+		}
+		first = false;
+
+		while (i < n && a[i] == val) {
+			prevCDF_a += 1.0 / n;
+			i++;
+		}
+		while (j < m && b[j] == val) {
+			prevCDF_b += 1.0 / m;
+			j++;
+		}
+		prevVal = val;
+	}
+
+	return totalDist;
+}
+
+
+double wassersteinPresorted(const std::vector<double> &a, const std::vector<double> &b) {
 
 	size_t n = a.size();
 	size_t m = b.size();
@@ -86,7 +130,8 @@ double wassersteinDistance(std::vector<double> a, std::vector<double> b) {
 		}
 
 		if (!first) {
-			totalDist += std::abs(prevCDF_a - prevCDF_b) * (val - prevVal);
+			double diff = prevCDF_a - prevCDF_b;
+			totalDist += std::abs(diff) * (val - prevVal);
 		}
 		first = false;
 
@@ -128,6 +173,7 @@ struct SimulationResult {
 	std::vector<double> leftForkTimes;
 	std::vector<double> rightForkTimes;
 	std::vector<int> firedOriginPositions;
+	std::vector<int> terminationPositions;
 	double completionTime;
 };
 
@@ -151,7 +197,6 @@ struct Arguments {
 	int threads = 1;
 	double EdUpulseLength; // in minutes
 	double BrdUpulseLength; // in minutes
-	bool makePlots = false;
 };
 
 
@@ -281,10 +326,6 @@ Arguments parseIODArguments( int argc, char** argv ) {
 			args.threads = std::stoi(strArg);
 			i += 2; // Skip the flag and its argument
 		}
-        else if (flag == "--makePlots") {
-            args.makePlots = true;
-            i += 1; // Skip the flag
-        }
         else throw InvalidOption( flag );
 	}
     if ( !args.specifiedOutput or !args.specifiedPulse1 or !args.specifiedPulse2 or !args.specifiedOrigin or !args.specifiedTermination or !args.specifiedDetect or (!args.specifiedLeft and !args.specifiedRight) ) {
@@ -302,6 +343,7 @@ SimulationResult runGillespie(int m, double v, double fr, std::mt19937 &gen) {
 	std::vector<bool> replicated(m + 1, false);
 	std::vector<Fork> forks;
 	std::vector<int> firedOrigins;
+	std::vector<int> terminationPositions;
 	int nUnreplicated = m + 1;
 
 	std::uniform_real_distribution<double> uniform(0.0, 1.0);
@@ -368,9 +410,13 @@ SimulationResult runGillespie(int m, double v, double fr, std::mt19937 &gen) {
 			int newPos = forks[k].position + forks[k].direction;
 
 			if (newPos < 0 || newPos > m || replicated[newPos]) {
-				// Fork termination: boundary or collision (no Ori to sync with)
+				// Fork termination: boundary or collision
 				forks[k] = forks.back();
 				forks.pop_back();
+				if (newPos >= 0 && newPos <= m && replicated[newPos]) {
+					// Record termination position
+					terminationPositions.push_back(newPos);
+				}
 			} else {
 				// chr![newPos] syncs with Ori[newPos]: passive replication
 				replicated[newPos] = true;
@@ -385,7 +431,7 @@ SimulationResult runGillespie(int m, double v, double fr, std::mt19937 &gen) {
 		}
 	}
 
-	return {leftForkTimes, rightForkTimes, firedOrigins, t};
+	return {leftForkTimes, rightForkTimes, firedOrigins, terminationPositions, t};
 }
 
 
@@ -401,6 +447,8 @@ std::pair<std::vector<ForkCall>, std::vector<ForkCall>> parseForkCalls(
 	std::vector<ForkCall> rightForkCalls;
 
 	int n = std::min(readEnd + 1, static_cast<int>(result.leftForkTimes.size()));
+	int BrdUReqLength = 2; // minimum length of BrdU track to call a fork (ensures that this would likely be called as a fork by DNAscent's read end QC)
+	int EdUReqLength = 2; // minimum length of EdU track to call a fork (ensures that this would likely be called as a fork by DNAscent's read end
 
 	// Parse left fork tracks (direction = -1)
 	// Contiguous segments where leftForkTimes >= 0 each correspond to one left fork
@@ -433,12 +481,14 @@ std::pair<std::vector<ForkCall>, std::vector<ForkCall>> parseForkCalls(
 				brduEnd = j;
 			}
 		}
+		
 
 		// This length check ensures that this would actually be called as a fork by DNAscent
 		int EdULength = (eduStart != -1 && eduEnd != -1) ? std::abs(eduEnd - eduStart + 1) : 0;
 		int BrdULength = (brduStart != -1 && brduEnd != -1) ? std::abs(brduEnd - brduStart + 1) : 0;
 
-		if (eduStart != -1 && brduStart != -1 && EdULength >= 2 && BrdULength >= 2) {
+		// check that BrdU track extends at least 2 kb from read start, otherwise this would likely be filtered out by DNAscent's read end QC
+		if (eduStart != -1 && brduStart != -1 && EdULength >= EdUReqLength && BrdULength >= BrdUReqLength && std::abs(brduEnd - readStart) >= 1) { 
 			ForkCall call;
 			call.EdU_start = eduStart;
 			call.EdU_end = eduEnd;
@@ -453,6 +503,9 @@ std::pair<std::vector<ForkCall>, std::vector<ForkCall>> parseForkCalls(
 	n = std::min(readEnd + 1, static_cast<int>(result.rightForkTimes.size()));
 	i = readStart;
 	while (i < n) {
+
+		int BrdUReqLength = 2; // minimum length of BrdU track to call a fork (ensures that this would likely be called as a fork by DNAscent's read end QC)
+		int EdUReqLength = 2; // minimum length of EdU track to call a fork (ensures that this would likely be called as a fork by DNAscent's read end
 
 		// Skip positions that weren't replicated by a right fork
 		if (result.rightForkTimes[i] < 0) {
@@ -480,12 +533,12 @@ std::pair<std::vector<ForkCall>, std::vector<ForkCall>> parseForkCalls(
 				brduEnd = j;
 			}
 		}
-
+		
 		// This length check ensures that this would actually be called as a fork by DNAscent
 		int EdULength = (eduStart != -1 && eduEnd != -1) ? std::abs(eduEnd - eduStart + 1) : 0;
 		int BrdULength = (brduStart != -1 && brduEnd != -1) ? std::abs(brduEnd - brduStart + 1) : 0;
 
-		if (eduStart != -1 && brduStart != -1 && EdULength >= 2 && BrdULength >= 2) {
+		if (eduStart != -1 && brduStart != -1 && EdULength >= EdUReqLength && BrdULength >= BrdUReqLength && std::abs(brduEnd - readEnd) >= 1) {
 			ForkCall call;
 			call.EdU_start = eduStart;
 			call.EdU_end = eduEnd;
@@ -644,8 +697,8 @@ std::vector<double> calcOriginForkDistances(
 	const std::string &leftForkFile,
 	const std::string &rightForkFile) {
 
-	// Parse origin BED: readID -> origin midpoint
-	std::map<std::string, int> originMidpoints;
+	// Parse origin BED: readID -> list of origin midpoints (multiple origins per read)
+	std::map<std::string, std::vector<int>> originMidpoints;
 	{
 		std::ifstream file(originFile);
 		if (!file.is_open()) {
@@ -659,7 +712,7 @@ std::vector<double> calcOriginForkDistances(
 				std::string readID = columns[3];
 				int start = std::stoi(columns[1]);
 				int end = std::stoi(columns[2]);
-				originMidpoints[readID] = (start + end) / 2;
+				originMidpoints[readID].push_back((start + end) / 2);
 			}
 		}
 	}
@@ -679,7 +732,7 @@ std::vector<double> calcOriginForkDistances(
 				std::string readID = columns[3];
 				int pulse5Prime = std::stoi(columns[1]);
                 int read5Prime = std::stoi(columns[4]);
-				if (std::abs(pulse5Prime - read5Prime) == 0) continue; // ignore forks near the end of the read
+				if (std::abs(pulse5Prime - read5Prime) < 1000) continue; // ignore forks near the end of the read
 				leftForkTips[readID].push_back(pulse5Prime);
 			}
 		}
@@ -700,40 +753,77 @@ std::vector<double> calcOriginForkDistances(
 				std::string readID = columns[3];
                 int pulse3Prime = std::stoi(columns[2]);
                 int read3Prime = std::stoi(columns[5]);
-				if (std::abs(read3Prime - pulse3Prime) == 0) continue; 
+				if (std::abs(read3Prime - pulse3Prime) < 1000) continue; // ignore forks near the end of the read
 				rightForkTips[readID].push_back(pulse3Prime);
 			}
 		}
 	}
 
-	// For each origin, calculate distance to the nearest fork tip
+	// For each origin, find the flanking left and right fork tips
+	// Only use a fork tip if no other origin sits between the origin and that tip
 	std::vector<double> distances;
-	for (const auto &origin : originMidpoints) {
-		const std::string &readID = origin.first;
-		int midpoint = origin.second;
+	for (const auto &entry : originMidpoints) {
+		const std::string &readID = entry.first;
+		const std::vector<int> &origins = entry.second;
 
 		auto leftIt = leftForkTips.find(readID);
-		int minLeftDist = -1;
-		if (leftIt != leftForkTips.end()) {
-			minLeftDist = std::abs(midpoint - leftIt->second[0]);
-			for (size_t j = 1; j < leftIt->second.size(); j++) {
-				int d = std::abs(midpoint - leftIt->second[j]);
-				if (d < minLeftDist) minLeftDist = d;
-			}
-		}
-
 		auto rightIt = rightForkTips.find(readID);
-		int minRightDist = -1;
-		if (rightIt != rightForkTips.end()) {
-			minRightDist = std::abs(rightIt->second[0] - midpoint);
-			for (size_t j = 1; j < rightIt->second.size(); j++) {
-				int d = std::abs(rightIt->second[j] - midpoint);
-				if (d < minRightDist) minRightDist = d;
-			}
-		}
 
-		// Take the tip of the fork that was furthest away from the midpoint
-		distances.push_back(static_cast<double>(std::max(minLeftDist, minRightDist))/1000.0); // convert to kb
+		for (size_t oi = 0; oi < origins.size(); oi++) {
+			int midpoint = origins[oi];
+
+			// Find the closest left fork tip that is to the left of this origin
+			int bestLeftDist = -1;
+			if (leftIt != leftForkTips.end()) {
+				for (size_t j = 0; j < leftIt->second.size(); j++) {
+					int tip = leftIt->second[j];
+					int d = midpoint - tip;
+					if (d < 0) continue; // tip is to the right, skip
+
+					// Check that no other origin on this read sits between this tip and the origin
+					bool blocked = false;
+					for (size_t ok = 0; ok < origins.size(); ok++) {
+						if (ok == oi) continue;
+						if (origins[ok] > tip && origins[ok] < midpoint) {
+							blocked = true;
+							break;
+						}
+					}
+					if (blocked) continue;
+
+					if (bestLeftDist == -1 || d < bestLeftDist) bestLeftDist = d;
+				}
+			}
+
+			// Find the closest right fork tip that is to the right of this origin
+			int bestRightDist = -1;
+			if (rightIt != rightForkTips.end()) {
+				for (size_t j = 0; j < rightIt->second.size(); j++) {
+					int tip = rightIt->second[j];
+					int d = tip - midpoint;
+					if (d < 0) continue; // tip is to the left, skip
+
+					// Check that no other origin on this read sits between this origin and this tip
+					bool blocked = false;
+					for (size_t ok = 0; ok < origins.size(); ok++) {
+						if (ok == oi) continue;
+						if (origins[ok] > midpoint && origins[ok] < tip) {
+							blocked = true;
+							break;
+						}
+					}
+					if (blocked) continue;
+
+					if (bestRightDist == -1 || d < bestRightDist) bestRightDist = d;
+				}
+			}
+
+			// Require both flanking forks, matching the simulation which only measures paired divergent forks
+			if (bestLeftDist == -1 || bestRightDist == -1) continue;
+
+			// Take the tip of the fork that was furthest away from the midpoint
+			distances.push_back(static_cast<double>(std::max(bestLeftDist, bestRightDist))/1000.0); // convert to kb
+		}
 	}
 
 	return distances;
@@ -825,8 +915,12 @@ int iod_main(int argc, char** argv) {
         bamReadlength(args.DetectInput, readLengths);       
     }
 
-	int nSims = 50000; 
+	int nSims = 100000; 
 	unsigned int seed = 42;
+	std::vector<double> *saveSimDist = nullptr;
+	std::vector<std::tuple<double, double, double>> landscapePoints; // (fr, IOD, W)
+	const size_t MAX_LANDSCAPE_SAMPLES = 50000;
+	std::map<double, std::pair<std::vector<double>, double>> landscapeSimDists; // fr -> (sorted_sim_dist, median_IOD)
 
 	// Objective function: run simulations at a given fr and return Wasserstein distance to data
 	// Also computes the median IOD for that firing rate
@@ -862,7 +956,28 @@ int iod_main(int argc, char** argv) {
 			}
 		}
 		medianIOD = vectorMedian(sim_IODs);
-		return wassersteinDistance(sim_originForkDistances, data_originForkDistances);
+
+		// Store subsampled, sorted sim distribution for bootstrap CI
+		{
+			std::vector<double> storedDist;
+			if (sim_originForkDistances.size() > MAX_LANDSCAPE_SAMPLES) {
+				storedDist.resize(MAX_LANDSCAPE_SAMPLES);
+				std::mt19937 subGen(42);
+				std::uniform_int_distribution<size_t> idx(0, sim_originForkDistances.size() - 1);
+				for (size_t s = 0; s < MAX_LANDSCAPE_SAMPLES; s++) {
+					storedDist[s] = sim_originForkDistances[idx(subGen)];
+				}
+			} else {
+				storedDist = sim_originForkDistances;
+			}
+			std::sort(storedDist.begin(), storedDist.end());
+			landscapeSimDists[fr] = {std::move(storedDist), medianIOD};
+		}
+
+		if (saveSimDist) *saveSimDist = sim_originForkDistances;
+		double w = wasserstein(sim_originForkDistances, data_originForkDistances);
+		landscapePoints.push_back(std::make_tuple(fr, medianIOD, w));
+		return w;
 	};
 
 	// Golden section search to find fr that minimises Wasserstein distance
@@ -875,33 +990,6 @@ int iod_main(int argc, char** argv) {
 	double tol = 1e-7;
 	double logTol = std::log10((frLow + tol) / frLow); // tolerance in log-space
 
-	// Scan the objective landscape and write to file for plotting
-	if (args.makePlots) {
-		std::vector<double> scanFrValues;
-		double multipliers[] = {1., 2., 4., 6., 8.};
-		for (double decade = frLow; decade < frHigh; decade *= 10.0) {
-			for (double m : multipliers) {
-				double val = decade * m;
-				if (val >= frLow && val <= frHigh) scanFrValues.push_back(val);
-			}
-		}
-		if (scanFrValues.empty() || scanFrValues.back() < frHigh) scanFrValues.push_back(frHigh);
-		int nScanPoints = scanFrValues.size();
-		std::ofstream landscapeFile(args.output + "_landscape.tsv");
-		landscapeFile << "fr\tIOD\tWasserstein" << std::endl;
-		std::cerr << "Scanning objective landscape (" << nScanPoints << " points)..." << std::endl;
-		for (int s = 0; s < nScanPoints; s++) {
-			double fr = scanFrValues[s];
-			double scanIOD;
-			double scanW = objective(fr, scanIOD);
-			landscapeFile << std::scientific << std::setprecision(6) << fr << "\t"
-						<< std::fixed << std::setprecision(1) << scanIOD << "\t"
-						<< std::fixed << std::setprecision(4) << scanW << std::endl;
-			std::cerr << "\r  [" << s + 1 << "/" << nScanPoints << "]" << std::flush;
-		}
-		landscapeFile.close();
-		std::cerr << std::endl << "Landscape written to " << args.output + "_landscape.tsv" << std::endl;
-	}
 	const double invPhi = (std::sqrt(5.0) - 1.0) / 2.0; // ~0.618
 
 	double lx1 = logFrHigh - invPhi * (logFrHigh - logFrLow);
@@ -945,16 +1033,90 @@ int iod_main(int argc, char** argv) {
 	double bestW = std::min(f1, f2);
 	double bestIOD = (f1 < f2) ? iod1 : iod2;
 
-	// Estimate uncertainty via local curvature of the objective
-	// Evaluate at three points around the optimum in log-space,
-	// then convert uncertainty to IOD-space using the IOD values at those points
-	double logBestFr = std::log10(bestFr);
-	double logH = 0.05; // step in log10(fr) space
-	double iodLeft, iodCentre, iodRight;
-	double fLeft = objective(std::pow(10.0, logBestFr - logH), iodLeft);
-	double fCentre = objective(bestFr, iodCentre);
-	double fRight = objective(std::pow(10.0, logBestFr + logH), iodRight);
-	double curvature = (fLeft - 2.0 * fCentre + fRight) / (logH * logH);
+	// Evaluate at the optimum to get the simulation distribution for output
+	std::vector<double> bestSimDist;
+	saveSimDist = &bestSimDist;
+	double iodAtBest;
+	double wAtBest = objective(bestFr, iodAtBest);
+	saveSimDist = nullptr;
+	bestIOD = iodAtBest;
+	bestW = wAtBest;
+
+	// Bootstrap CI: resample the observed data and find the best landscape point for each resample
+	const int nBootstrap = 1000;
+	std::vector<double> bootstrapIODs;
+	bootstrapIODs.reserve(nBootstrap);
+
+	std::mt19937 bootGen(42);
+	std::uniform_int_distribution<size_t> dataDist(0, data_originForkDistances.size() - 1);
+
+	for (int b = 0; b < nBootstrap; b++) {
+
+		// Resample data with replacement
+		std::vector<double> bootData(data_originForkDistances.size());
+		for (size_t i = 0; i < data_originForkDistances.size(); i++) {
+			bootData[i] = data_originForkDistances[dataDist(bootGen)];
+		}
+		std::sort(bootData.begin(), bootData.end());
+
+		// Compute Wasserstein distance at each landscape point for this bootstrap sample
+		std::vector<std::pair<double, double>> bootLandscape; // (log10(fr), W)
+		std::vector<std::pair<double, double>> iodLandscape;  // (log10(fr), IOD)
+		for (const auto& lp : landscapeSimDists) {
+			double logFr = std::log10(lp.first);
+			double w = wassersteinPresorted(lp.second.first, bootData);
+			bootLandscape.push_back({logFr, w});
+			iodLandscape.push_back({logFr, lp.second.second});
+		}
+
+		// Find the index of the minimum W
+		size_t minIdx = 0;
+		for (size_t i = 1; i < bootLandscape.size(); i++) {
+			if (bootLandscape[i].second < bootLandscape[minIdx].second) minIdx = i;
+		}
+
+		// Fit a quadratic to the minimum and its neighbours to interpolate
+		double bootIOD;
+		if (minIdx > 0 && minIdx < bootLandscape.size() - 1) {
+			double x0 = bootLandscape[minIdx - 1].first, w0 = bootLandscape[minIdx - 1].second;
+			double x1 = bootLandscape[minIdx].first,     w1 = bootLandscape[minIdx].second;
+			double x2 = bootLandscape[minIdx + 1].first, w2 = bootLandscape[minIdx + 1].second;
+
+			// Vertex of parabola through (x0,w0), (x1,w1), (x2,w2)
+			double denom = (x0 - x1) * (x0 - x2) * (x1 - x2);
+			double a = (x2 * (w1 - w0) + x1 * (w0 - w2) + x0 * (w2 - w1)) / denom;
+
+			if (a > 0) {
+				double b = (x2 * x2 * (w0 - w1) + x1 * x1 * (w2 - w0) + x0 * x0 * (w1 - w2)) / denom;
+				double xStar = -b / (2.0 * a);
+
+				// Clamp to the bracket to avoid extrapolation
+				xStar = std::max(x0, std::min(x2, xStar));
+
+				// Linearly interpolate IOD at xStar
+				double iod0 = iodLandscape[minIdx - 1].second;
+				double iod1_val = iodLandscape[minIdx].second;
+				double iod2 = iodLandscape[minIdx + 1].second;
+				if (xStar <= x1) {
+					double t = (x1 - x0 > 0) ? (xStar - x0) / (x1 - x0) : 0.0;
+					bootIOD = iod0 + t * (iod1_val - iod0);
+				} else {
+					double t = (x2 - x1 > 0) ? (xStar - x1) / (x2 - x1) : 0.0;
+					bootIOD = iod1_val + t * (iod2 - iod1_val);
+				}
+			} else {
+				bootIOD = iodLandscape[minIdx].second;
+			}
+		} else {
+			bootIOD = iodLandscape[minIdx].second;
+		}
+
+		bootstrapIODs.push_back(bootIOD);
+	}
+
+	std::sort(bootstrapIODs.begin(), bootstrapIODs.end());
+	double ciLow = bootstrapIODs[static_cast<int>(std::floor(0.025 * nBootstrap))];
+	double ciHigh = bootstrapIODs[static_cast<int>(std::ceil(0.975 * nBootstrap)) - 1];
 
 	std::cerr << "Parameter search complete." << std::endl << std::endl;
 	std::cerr << "Summary:" << std::endl;
@@ -962,20 +1124,46 @@ int iod_main(int argc, char** argv) {
 	std::cerr << "Optimal fr = " << std::scientific << std::setprecision(3) << bestFr << std::endl;
 	std::cerr << "Wasserstein distance = " << std::fixed << std::setprecision(3) << bestW << std::endl;
 	std::cerr << "Median IOD = " << std::fixed << std::setprecision(0) << bestIOD << " kb" << std::endl;
+	std::cerr << "95% confidence interval: [" << std::fixed << std::setprecision(0) << ciLow << " kb , " << std::fixed << std::setprecision(0) << ciHigh << " kb]" << std::endl;
 
-	if (curvature > 0) {
-		// Uncertainty in log10(fr)-space
-		double logFrUncertainty = 1.96 / std::sqrt(curvature);
-
-		// Convert log10(fr) uncertainty to IOD uncertainty using dIOD/dlog10(fr)
-		double dIOD_dlogFr = (iodRight - iodLeft) / (2.0 * logH);
-		double iodUncertainty = std::abs(dIOD_dlogFr) * logFrUncertainty;
-
-		std::cerr << "Curvature at minimum: " << std::scientific << std::setprecision(3) << curvature << std::endl;
-		std::cerr << "95% confidence interval: [" << std::fixed << std::setprecision(0) << bestIOD - iodUncertainty << " kb , " << std::fixed << std::setprecision(0) << bestIOD + iodUncertainty << " kb]" << std::endl;
-	} else {
-		std::cerr << "Warning: curvature is non-positive (" << std::scientific << std::setprecision(3) << curvature << "), uncertainty could not be estimated." << std::endl;
+	// Write output file
+	auto t = std::time(nullptr);
+	auto tm = *std::localtime(&t);
+	std::ostringstream oss;
+	oss << std::put_time(&tm, "%d/%m/%Y %H:%M:%S");
+	auto startTime = oss.str();
+	std::ofstream outFile(args.output);
+	outFile << "#DetectFile " << args.DetectInput << "\n";
+	outFile << "#ForkFiles " << args.lForkInput << " " << args.rForkInput << "\n";
+	outFile << "#OriginFile " << args.originInput << "\n";
+	outFile << "#TerminationFile " << args.terminationInput << "\n";
+	outFile << "#SystemStartTime " + startTime + "\n";
+	outFile << "#Software " << std::string(getExePath()) << "\n";
+	outFile << "#Version " << std::string(VERSION) << "\n";
+	outFile << "#Commit " << std::string(getGitCommit()) << "\n";
+	outFile << "#MeanForkSpeed " << std::fixed << std::setprecision(3) << avgForkSpeed << "\n";
+	outFile << "#OptimalFiringRate " << std::scientific << std::setprecision(6) << bestFr << "\n";
+	outFile << "#WassersteinDistance " << std::fixed << std::setprecision(6) << bestW << "\n";
+	outFile << "#MedianIOD " << std::fixed << std::setprecision(1) << bestIOD << "\n";
+	outFile << "#95ConfidenceInterval " << std::fixed << std::setprecision(1) << ciLow << " " << ciHigh << "\n";
+	outFile << ">DataOriginForkDistances:\n";
+	for (const auto& val : data_originForkDistances) {
+		outFile << val << "\n";
 	}
+	outFile << ">SimOriginForkDistances:\n";
+	for (const auto& val : bestSimDist) {
+		outFile << val << "\n";
+	}
+
+	// Write landscape from points collected during the search (sorted by fr)
+	std::sort(landscapePoints.begin(), landscapePoints.end());
+	outFile << ">Landscape:\n";
+	for (const auto& pt : landscapePoints) {
+		outFile << std::scientific << std::setprecision(6) << std::get<0>(pt) << "\t"
+				<< std::fixed << std::setprecision(1) << std::get<1>(pt) << "\t"
+				<< std::fixed << std::setprecision(4) << std::get<2>(pt) << "\n";
+	}
+	outFile.close();
 
 	return 0;
 }

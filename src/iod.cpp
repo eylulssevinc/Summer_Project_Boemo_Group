@@ -613,7 +613,8 @@ std::vector<double> runPulseChase(SimulationResult &result, std::mt19937 &gen, s
 		int rightDistance = pair.rightFork.BrdU_end - originPos;
 		assert(rightDistance >= 0); // right fork should be right of origin
 
-		forkDistanceTravelled.push_back(std::max(leftDistance, rightDistance));
+		forkDistanceTravelled.push_back(leftDistance);
+		forkDistanceTravelled.push_back(rightDistance);
 	}
 
 	return forkDistanceTravelled;
@@ -822,7 +823,8 @@ std::vector<double> calcOriginForkDistances(
 			if (bestLeftDist == -1 || bestRightDist == -1) continue;
 
 			// Take the tip of the fork that was furthest away from the midpoint
-			distances.push_back(static_cast<double>(std::max(bestLeftDist, bestRightDist))/1000.0); // convert to kb
+			distances.push_back(static_cast<double>(bestLeftDist)/1000.0); // convert to kb
+			distances.push_back(static_cast<double>(bestRightDist)/1000.0); // convert to kb
 		}
 	}
 
@@ -1042,20 +1044,85 @@ int iod_main(int argc, char** argv) {
 	bestIOD = iodAtBest;
 	bestW = wAtBest;
 
+	// The golden section search clusters most evaluation points near the
+	// optimum, leaving large gaps elsewhere.  The bootstrap needs coverage
+	// across the full firing-rate range so that resampled optima can be
+	// located accurately rather than snapping to sparse points.
+	{
+		std::cerr << "Building landscape for confidence interval estimation..." << std::endl;
+		int savedNSims = nSims;
+		nSims = 20000;
+
+		double logBestFr = std::log10(bestFr);
+		double logFrMin  = std::log10(1e-5);
+		double logFrMax  = std::log10(1e-2);
+
+		// Broad grid across full range
+		const int nBroad = 10;
+		for (int i = 0; i < nBroad; i++) {
+			double logFr = logFrMin + i * (logFrMax - logFrMin) / (nBroad - 1);
+			bool exists = false;
+			for (const auto &lp : landscapeSimDists) {
+				if (std::abs(std::log10(lp.first) - logFr) < 0.05) { exists = true; break; }
+			}
+			if (!exists) {
+				double iod;
+				objective(std::pow(10.0, logFr), iod);
+			}
+		}
+
+		// Fine grid: +/- 1 decade around optimum
+		const int nFine = 20;
+		double fineLogLow  = std::max(logFrMin,  logBestFr - 1.0);
+		double fineLogHigh = std::min(logFrMax, logBestFr + 1.0);
+		for (int i = 0; i < nFine; i++) {
+			double logFr = fineLogLow + i * (fineLogHigh - fineLogLow) / (nFine - 1);
+			bool exists = false;
+			for (const auto &lp : landscapeSimDists) {
+				if (std::abs(std::log10(lp.first) - logFr) < 0.02) { exists = true; break; }
+			}
+			if (!exists) {
+				double iod;
+				objective(std::pow(10.0, logFr), iod);
+			}
+		}
+
+		nSims = savedNSims;
+		std::cerr << "Landscape has " << landscapeSimDists.size() << " points for bootstrap CI." << std::endl;
+	}
+
 	// Bootstrap CI: resample the observed data and find the best landscape point for each resample
-	const int nBootstrap = 1000;
+	const int nBootstrap = 10000;
 	std::vector<double> bootstrapIODs;
 	bootstrapIODs.reserve(nBootstrap);
 
 	std::mt19937 bootGen(42);
 	std::uniform_int_distribution<size_t> dataDist(0, data_originForkDistances.size() - 1);
 
+	// Smoothed bootstrap: add small Gaussian noise to each resampled
+	// point to avoid discreteness artefacts with small sample sizes.
+	double dataSD = 0.0;
+	{
+		double dataMean = 0.0;
+		for (const auto &v : data_originForkDistances) dataMean += v;
+		dataMean /= data_originForkDistances.size();
+		for (const auto &v : data_originForkDistances) dataSD += (v - dataMean) * (v - dataMean);
+		dataSD = std::sqrt(dataSD / (data_originForkDistances.size() - 1));
+	}
+	double smoothBW = dataSD * std::pow(static_cast<double>(data_originForkDistances.size()), -0.2) * 0.5;
+	std::normal_distribution<double> noiseDist(0.0, smoothBW);
+	double shrinkFactor = 1.0 / std::sqrt(1.0 + (smoothBW * smoothBW) / (dataSD * dataSD));
+	double dataMean = 0.0;
+	for (const auto &v : data_originForkDistances) dataMean += v;
+	dataMean /= data_originForkDistances.size();
+
 	for (int b = 0; b < nBootstrap; b++) {
 
-		// Resample data with replacement
+		// Resample data with replacement and smooth
 		std::vector<double> bootData(data_originForkDistances.size());
 		for (size_t i = 0; i < data_originForkDistances.size(); i++) {
-			bootData[i] = data_originForkDistances[dataDist(bootGen)];
+			double val = data_originForkDistances[dataDist(bootGen)] + noiseDist(bootGen);
+			bootData[i] = std::max(0.0, dataMean + (val - dataMean) * shrinkFactor);
 		}
 		std::sort(bootData.begin(), bootData.end());
 

@@ -41,8 +41,10 @@ def main():
     median_iod = float(headers.get('MedianIOD', 0))
     ci = headers.get('95ConfidenceInterval', None)
 
-    data_dist = np.array([float(x) for x in sections.get('DataOriginForkDistances', [])])
-    sim_dist = np.array([float(x) for x in sections.get('SimOriginForkDistances', [])])
+    data_single = np.array([float(x) for x in sections.get('DataSingleForkDistances', [])])
+    sim_single = np.array([float(x) for x in sections.get('SimSingleForkDistances', [])])
+    data_pair = np.array([float(x) for x in sections.get('DataForkPairDistances', [])])
+    sim_pair = np.array([float(x) for x in sections.get('SimForkPairDistances', [])])
 
     landscape_raw = sections.get('Landscape', [])
     landscape_fr, landscape_iod, landscape_w = [], [], []
@@ -55,7 +57,7 @@ def main():
     landscape_iod = np.array(landscape_iod)
     landscape_w = np.array(landscape_w)
 
-    fig, axes = plt.subplots(2, 2, figsize=(16, 9))
+    fig, axes = plt.subplots(2, 3, figsize=(20, 9))
 
     # Panel 1: Objective landscape
     ax = axes[0,0]
@@ -77,32 +79,59 @@ def main():
         ax.axvspan(lo, hi, alpha=0.15, color='grey', label=f'95% CI [{lo:.0f}, {hi:.0f}] kb')
     ax.legend(fontsize=8)
 
-    # Panel 3: CDF comparison of data vs simulated distances
-    ax = axes[1,0]
-    if len(data_dist) > 0:
-        data_sorted = np.sort(data_dist)
-        data_cdf = np.arange(1, len(data_sorted) + 1) / len(data_sorted)
-        ax.step(data_sorted, data_cdf, where='post', color='#2166ac', linewidth=1.5, label='Data')
-    if len(sim_dist) > 0:
-        sim_sorted = np.sort(sim_dist)
-        sim_cdf = np.arange(1, len(sim_sorted) + 1) / len(sim_sorted)
-        ax.step(sim_sorted, sim_cdf, where='post', color='#b2182b', linewidth=1.5, label='Simulated (best fr)')
-    ax.set_xlabel('Origin-to-fork-tip distance (kb)')
-    ax.set_ylabel('Cumulative probability')
-    ax.set_title('Distribution fit')
+    # Panel 3: Histogram — single-fork distances
+    ax = axes[0,2]
+    if len(data_single) > 0 or len(sim_single) > 0:
+        all_single = np.concatenate([d for d in [data_single, sim_single] if len(d) > 0])
+        bins_s = np.linspace(0, np.percentile(all_single, 99), 40)
+        if len(data_single) > 0:
+            ax.hist(data_single, bins=bins_s, density=True, alpha=0.5, color='#2166ac', label='Data')
+        if len(sim_single) > 0:
+            ax.hist(sim_single, bins=bins_s, density=True, alpha=0.5, color='#b2182b', label='Simulated')
+    ax.set_xlabel('Single-fork behind-distance (kb)')
+    ax.set_ylabel('Density')
+    ax.set_title('Single-fork histograms')
     ax.legend(fontsize=8)
 
-    # Panel 4: Histogram comparison
+    # Panel 4: CDF comparison — single-fork behind-distances
+    ax = axes[1,0]
+    if len(data_single) > 0:
+        s = np.sort(data_single)
+        ax.step(s, np.arange(1, len(s)+1)/len(s), where='post', color='#2166ac', linewidth=1.5, label='Data')
+    if len(sim_single) > 0:
+        s = np.sort(sim_single)
+        ax.step(s, np.arange(1, len(s)+1)/len(s), where='post', color='#b2182b', linewidth=1.5, label='Simulated')
+    ax.set_xlabel('Single-fork behind-distance (kb)')
+    ax.set_ylabel('Cumulative probability')
+    ax.set_title('Single-fork distances')
+    ax.legend(fontsize=8)
+
+    # Panel 5: CDF comparison — fork-pair EdU start distances
     ax = axes[1,1]
-    all_vals = np.concatenate([d for d in [data_dist, sim_dist] if len(d) > 0])
-    bins = np.linspace(0, np.percentile(all_vals, 99), 40) if len(all_vals) > 0 else 40
-    if len(data_dist) > 0:
-        ax.hist(data_dist, bins=bins, density=True, alpha=0.5, color='#2166ac', label='Data')
-    if len(sim_dist) > 0:
-        ax.hist(sim_dist, bins=bins, density=True, alpha=0.5, color='#b2182b', label='Simulated (best fr)')
-    ax.set_xlabel('Origin-to-fork-tip distance (kb)')
+    if len(data_pair) > 0:
+        s = np.sort(data_pair)
+        ax.step(s, np.arange(1, len(s)+1)/len(s), where='post', color='#2166ac', linewidth=1.5, label='Data')
+    if len(sim_pair) > 0:
+        s = np.sort(sim_pair)
+        ax.step(s, np.arange(1, len(s)+1)/len(s), where='post', color='#b2182b', linewidth=1.5, label='Simulated')
+    ax.set_xlabel('Fork-pair EdU start distance (kb)')
+    ax.set_ylabel('Cumulative probability')
+    ax.set_title('Fork-pair distances')
+    ax.legend(fontsize=8)
+
+    # Panel 6: Histogram — fork-pair distances
+    ax = axes[1,2]
+    if len(data_pair) > 0 or len(sim_pair) > 0:
+        all_pair = np.concatenate([d for d in [data_pair, sim_pair] if len(d) > 0])
+        bins_p = np.linspace(0, np.percentile(all_pair, 99), 40)
+        if len(data_pair) > 0:
+            ax.hist(data_pair, bins=bins_p, density=True, alpha=0.5, color='#2166ac', label='Data')
+        if len(sim_pair) > 0:
+            ax.hist(sim_pair, bins=bins_p, density=True, alpha=0.5, color='#b2182b', label='Simulated')
+    ax.set_xlabel('Fork-pair EdU start distance (kb)')
     ax.set_ylabel('Density')
-    ax.set_title('Distribution histogram')
+    ax.set_yscale('log')
+    ax.set_title('Fork-pair histograms')
     ax.legend(fontsize=8)
 
     plt.tight_layout()

@@ -41,10 +41,10 @@ def main():
     median_iod = float(headers.get('MedianIOD', 0))
     ci = headers.get('95ConfidenceInterval', None)
 
-    data_single = np.array([float(x) for x in sections.get('DataSingleForkDistances', [])])
-    sim_single = np.array([float(x) for x in sections.get('SimSingleForkDistances', [])])
-    data_pair = np.array([float(x) for x in sections.get('DataForkPairDistances', [])])
-    sim_pair = np.array([float(x) for x in sections.get('SimForkPairDistances', [])])
+    data_behind = np.array([float(x) for x in sections.get('DataBehindDistances', [])])
+    sim_behind = np.array([float(x) for x in sections.get('SimBehindDistances', [])])
+    data_ahead = np.array([float(x) for x in sections.get('DataAheadDistances', [])])
+    sim_ahead = np.array([float(x) for x in sections.get('SimAheadDistances', [])])
 
     landscape_raw = sections.get('Landscape', [])
     landscape_fr, landscape_iod, landscape_w = [], [], []
@@ -79,59 +79,58 @@ def main():
         ax.axvspan(lo, hi, alpha=0.15, color='grey', label=f'95% CI [{lo:.0f}, {hi:.0f}] kb')
     ax.legend(fontsize=8)
 
-    # Panel 3: Histogram — single-fork distances
+    # Panel 3: Histogram — behind-fork distances
     ax = axes[0,2]
-    if len(data_single) > 0 or len(sim_single) > 0:
-        all_single = np.concatenate([d for d in [data_single, sim_single] if len(d) > 0])
-        bins_s = np.linspace(0, np.percentile(all_single, 99), 40)
-        if len(data_single) > 0:
-            ax.hist(data_single, bins=bins_s, density=True, alpha=0.5, color='#2166ac', label='Data')
-        if len(sim_single) > 0:
-            ax.hist(sim_single, bins=bins_s, density=True, alpha=0.5, color='#b2182b', label='Simulated')
-    ax.set_xlabel('Single-fork behind-distance (kb)')
+    if len(data_behind) > 0 or len(sim_behind) > 0:
+        all_behind = np.concatenate([d for d in [data_behind, sim_behind] if len(d) > 0])
+        bins_b = np.linspace(0, np.percentile(all_behind, 99), 40)
+        if len(data_behind) > 0:
+            ax.hist(data_behind, bins=bins_b, density=True, alpha=0.5, color='#2166ac', label='Data')
+        if len(sim_behind) > 0:
+            ax.hist(sim_behind, bins=bins_b, density=True, alpha=0.5, color='#b2182b', label='Simulated')
+    ax.set_xlabel('Behind-fork distance (kb)')
     ax.set_ylabel('Density')
-    ax.set_title('Single-fork histograms')
+    ax.set_title('Behind-fork histograms')
     ax.legend(fontsize=8)
 
-    # Panel 4: CDF comparison — single-fork behind-distances
+    # Panel 4: CDF comparison — behind-fork distances
     ax = axes[1,0]
-    if len(data_single) > 0:
-        s = np.sort(data_single)
+    if len(data_behind) > 0:
+        s = np.sort(data_behind)
         ax.step(s, np.arange(1, len(s)+1)/len(s), where='post', color='#2166ac', linewidth=1.5, label='Data')
-    if len(sim_single) > 0:
-        s = np.sort(sim_single)
+    if len(sim_behind) > 0:
+        s = np.sort(sim_behind)
         ax.step(s, np.arange(1, len(s)+1)/len(s), where='post', color='#b2182b', linewidth=1.5, label='Simulated')
-    ax.set_xlabel('Single-fork behind-distance (kb)')
+    ax.set_xlabel('Behind-fork distance (kb)')
     ax.set_ylabel('Cumulative probability')
-    ax.set_title('Single-fork distances')
+    ax.set_title('Behind-fork CDFs')
     ax.legend(fontsize=8)
 
-    # Panel 5: CDF comparison — fork-pair EdU start distances
+    # Panel 5: CDF comparison — ahead-of-fork distances
     ax = axes[1,1]
-    if len(data_pair) > 0:
-        s = np.sort(data_pair)
+    if len(data_ahead) > 0:
+        s = np.sort(data_ahead)
         ax.step(s, np.arange(1, len(s)+1)/len(s), where='post', color='#2166ac', linewidth=1.5, label='Data')
-    if len(sim_pair) > 0:
-        s = np.sort(sim_pair)
+    if len(sim_ahead) > 0:
+        s = np.sort(sim_ahead)
         ax.step(s, np.arange(1, len(s)+1)/len(s), where='post', color='#b2182b', linewidth=1.5, label='Simulated')
-    ax.set_xlabel('Fork-pair EdU start distance (kb)')
+    ax.set_xlabel('Ahead-of-fork distance (kb)')
     ax.set_ylabel('Cumulative probability')
-    ax.set_title('Fork-pair distances')
+    ax.set_title('Ahead-of-fork CDFs')
     ax.legend(fontsize=8)
 
-    # Panel 6: Histogram — fork-pair distances
+    # Panel 6: Histogram — ahead-of-fork distances
     ax = axes[1,2]
-    if len(data_pair) > 0 or len(sim_pair) > 0:
-        all_pair = np.concatenate([d for d in [data_pair, sim_pair] if len(d) > 0])
-        bins_p = np.linspace(0, np.percentile(all_pair, 99), 40)
-        if len(data_pair) > 0:
-            ax.hist(data_pair, bins=bins_p, density=True, alpha=0.5, color='#2166ac', label='Data')
-        if len(sim_pair) > 0:
-            ax.hist(sim_pair, bins=bins_p, density=True, alpha=0.5, color='#b2182b', label='Simulated')
-    ax.set_xlabel('Fork-pair EdU start distance (kb)')
+    if len(data_ahead) > 0 or len(sim_ahead) > 0:
+        all_ahead = np.concatenate([d for d in [data_ahead, sim_ahead] if len(d) > 0])
+        bins_a = np.linspace(0, np.percentile(all_ahead, 99), 40)
+        if len(data_ahead) > 0:
+            ax.hist(data_ahead, bins=bins_a, density=True, alpha=0.5, color='#2166ac', label='Data')
+        if len(sim_ahead) > 0:
+            ax.hist(sim_ahead, bins=bins_a, density=True, alpha=0.5, color='#b2182b', label='Simulated')
+    ax.set_xlabel('Ahead-of-fork distance (kb)')
     ax.set_ylabel('Density')
-    ax.set_yscale('log')
-    ax.set_title('Fork-pair histograms')
+    ax.set_title('Ahead-of-fork histograms')
     ax.legend(fontsize=8)
 
     plt.tight_layout()

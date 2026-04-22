@@ -558,7 +558,6 @@ void eventalign( DNAscent::read &r, unsigned int totalWindowLength){
 	while ( reference_index < r.referenceSeqMappedTo.size() - k + 1){
 
 		double insRate = (runningInsertions) / double(readHead+1);
-		double delRate = (runningDeletions) / double(reference_index+1);
 		if (insRate > 0.2){
 			r.QCpassed = false;
 			return;

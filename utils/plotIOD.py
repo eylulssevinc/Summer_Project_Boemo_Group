@@ -64,14 +64,14 @@ def main():
     ax.plot(landscape_fr, landscape_w, 'o-', color='#2166ac', markersize=3, linewidth=1)
     ax.set_xscale('log')
     ax.set_xlabel('Firing rate (fr)')
-    ax.set_ylabel('Wasserstein distance')
+    ax.set_ylabel('Energy distance')
     ax.set_title('Objective landscape')
 
     # Panel 2: Objective vs IOD
     ax = axes[0,1]
     ax.plot(landscape_iod, landscape_w, 'o-', color='#b2182b', markersize=3, linewidth=1)
     ax.set_xlabel('Median IOD (kb)')
-    ax.set_ylabel('Wasserstein distance')
+    ax.set_ylabel('Energy distance')
     ax.set_title('Objective vs IOD')
     ax.axvline(median_iod, color='grey', linestyle='--', linewidth=0.8, label=f'Best IOD = {median_iod:.0f} kb')
     if ci:

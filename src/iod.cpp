@@ -46,9 +46,16 @@
 double MODEL_RES = 10.; // 100 bp resolution
 
 static const char *help=
-"IOD: DNAscent executable that estimates inter-origin distance.\n"
-"To run DNAscent IOD, do:\n"
-"   DNAscent IOD -l /path/to/leftForks_DNAscent_forksense.bed -r /path/to/rightForks_DNAscent_forksense.bed -a /path/to/BrdU_DNAscent_forkSense.bed -d /path/to/detectOutput.bam -o /path/to/output.IOD \n"
+"meIODy: DNAscent executable that estimates inter-origin distance.\n"
+"To run DNAscent meIODy, do:\n"
+"   DNAscent meIODy -l /path/to/leftForks_DNAscent_forksense.bed \n"
+"                   -r /path/to/rightForks_DNAscent_forksense.bed \n"
+"                   --origin /path/to/origins_DNAscent_forkSense.bed \n"
+"                   --termination /path/to/terminations_DNAscent_forkSense.bed\n"
+"                   -d /path/to/detectOutput.bam -o /path/to/output.IOD\n"
+"                   --tPulse1 5. \n"
+"                   --tPulse2 10. \n"
+"                   -o /path/to/output.IOD \n"
 "Required arguments are:\n"
 "  -l,--left                 path to leftForks file from forkSense detect with `bed` extension,\n"
 "  -r,--right                path to rightFork file from forkSense detect with `bed` extension,\n"
@@ -147,6 +154,46 @@ double wassersteinPresorted(const std::vector<double> &a, const std::vector<doub
 	}
 
 	return totalDist;
+}
+
+
+// E|X-X'| for a sorted array a: (2/n^2) * sum_i a[i] * (2*i + 1 - n), 0-indexed.
+// This is the self-term used in the energy distance.
+double sortedSelfTerm(const std::vector<double> &a) {
+	size_t n = a.size();
+	if (n < 2) return 0.0;
+	double s = 0.0;
+	for (size_t i = 0; i < n; i++) {
+		s += a[i] * (2.0 * static_cast<double>(i) + 1.0 - static_cast<double>(n));
+	}
+	return 2.0 * s / (static_cast<double>(n) * static_cast<double>(n));
+}
+
+// Energy distance E(F,G) = 2*E|X-Y| - E|X-X'| - E|Y-Y'| between two 1-D distributions
+// given presorted sample arrays.  The cross-term E|X-Y| is evaluated in O(n+m) via a
+// merge sweep.  simSelfTerm = sortedSelfTerm(sim), dataSelfTerm = sortedSelfTerm(data),
+// dataTotal = sum of data elements (passed precomputed to avoid redundant work in hot loops).
+double energyDistancePresorted(const std::vector<double> &sim, double simSelfTerm,
+                               const std::vector<double> &data, double dataSelfTerm,
+                               double dataTotal) {
+	size_t n = sim.size();
+	size_t m = data.size();
+	if (n == 0 || m == 0) return 0.0;
+
+	double crossSum = 0.0;
+	double prefixData = 0.0;
+	size_t kD = 0;
+	for (size_t i = 0; i < n; i++) {
+		while (kD < m && data[kD] <= sim[i]) {
+			prefixData += data[kD];
+			kD++;
+		}
+		// kD elements of data are <= sim[i]
+		crossSum += static_cast<double>(kD) * sim[i] - prefixData
+		          + (dataTotal - prefixData) - static_cast<double>(m - kD) * sim[i];
+	}
+	double crossTerm = crossSum / (static_cast<double>(n) * static_cast<double>(m));
+	return 2.0 * crossTerm - simSelfTerm - dataSelfTerm;
 }
 
 
@@ -839,8 +886,13 @@ int iod_main(int argc, char** argv) {
 		data_maxDists[i] = std::max(data_behindDists[i], data_aheadDists[i]);
 	}
 
-	// Precompute mean for normalising the Wasserstein component
+	// Precompute mean for normalising the energy distance, plus sorted data, self-term, and
+	// element total — all fixed quantities reused in the objective, point estimate, and bootstrap.
 	double meanMax = vectorMean(data_maxDists);
+	std::vector<double> data_max_sorted = data_maxDists;
+	std::sort(data_max_sorted.begin(), data_max_sorted.end());
+	double dataMaxSelfTerm = sortedSelfTerm(data_max_sorted);
+	double dataMaxTotal = std::accumulate(data_max_sorted.begin(), data_max_sorted.end(), 0.0);
 
     // Parse detect output
     std::vector<int> readLengths;
@@ -854,7 +906,7 @@ int iod_main(int argc, char** argv) {
         bamReadlength(args.DetectInput, readLengths);       
     }
 
-	int nSims = 20000; 
+	int nSims = 50000; 
 	unsigned int seed = 42;
 	std::pair<std::vector<double>, std::vector<double>> *saveSimDist = nullptr;
 	std::vector<std::tuple<double, double, double>> landscapePoints; // (fr, IOD, W)
@@ -865,6 +917,7 @@ int iod_main(int argc, char** argv) {
 		std::vector<double> sortedBehind;
 		std::vector<double> sortedAhead;
 		double medianIOD;
+		double simSelfTermMax; // sortedSelfTerm(sortedMax), precomputed to avoid recomputation in bootstrap
 	};
 	std::map<double, LandscapeEntry> landscapeSimDists; // fr -> stored sim distributions + median IOD
 
@@ -935,21 +988,25 @@ int iod_main(int argc, char** argv) {
 			entry.sortedBehind = subsample(sim_behindDists, MAX_LANDSCAPE_SAMPLES);
 			entry.sortedAhead = subsample(sim_aheadDists, MAX_LANDSCAPE_SAMPLES);
 			entry.medianIOD = medianIOD;
+			entry.simSelfTermMax = sortedSelfTerm(entry.sortedMax);
 			landscapeSimDists[fr] = std::move(entry);
 		}
 
 		if (saveSimDist) *saveSimDist = {sim_behindDists, sim_aheadDists};
 
-		// Objective: Wasserstein distance on max(behind, ahead)
-		double w = (!sim_maxDists.empty() && !data_maxDists.empty()) ? wasserstein(sim_maxDists, data_maxDists) / meanMax : 0.0;
-		landscapePoints.push_back(std::make_tuple(fr, medianIOD, w));
-		return w;
+		// Objective: energy distance on max(behind, ahead), normalised by mean of data.
+		// Use the already-stored sorted subsample so the value is consistent with the bootstrap.
+		const LandscapeEntry &stored = landscapeSimDists[fr];
+		double e = (!stored.sortedMax.empty() && !data_max_sorted.empty())
+			? energyDistancePresorted(stored.sortedMax, stored.simSelfTermMax, data_max_sorted, dataMaxSelfTerm, dataMaxTotal) / meanMax
+			: 0.0;
+		landscapePoints.push_back(std::make_tuple(fr, medianIOD, e));
+		return e;
 	};
 
-	// Grid search in log10(fr) space: coarse pass across the full range,
-	// then a fine pass around the minimum.
+	// Grid search in log10(fr) space: coarse pass across the full range, then a fine pass around the minimum.
 	double logFrMin = std::log10(1e-5);
-	double logFrMax = std::log10(1e-2);
+	double logFrMax = std::log10(1e-3);
 
 	std::cerr << "Coarse grid search for optimal firing rate..." << std::endl;
 	const int nCoarse = 20;
@@ -962,7 +1019,7 @@ int iod_main(int argc, char** argv) {
 		double w = objective(fr, iod);
 		std::cerr << "[Coarse " << std::setw(2) << (i + 1) << "/" << nCoarse << "] "
 				  << "fr = " << std::scientific << std::setprecision(3) << std::setw(9) << fr
-				  << "  W = " << std::fixed << std::setprecision(3) << std::setw(5) << w << std::endl;
+				  << "  D = " << std::fixed << std::setprecision(5) << std::setw(5) << w << std::endl;
 		if (w < coarseBestW) {
 			coarseBestW = w;
 			coarseBestLogFr = logFr;
@@ -986,30 +1043,25 @@ int iod_main(int argc, char** argv) {
 		double w = objective(fr, iod);
 		std::cerr << "[Fine  " << std::setw(2) << (i + 1) << "/" << nFine << "] "
 				  << "fr = " << std::scientific << std::setprecision(3) << std::setw(9) << fr
-				  << "  W = " << std::fixed << std::setprecision(3) << std::setw(5) << w << std::endl;
+				  << "  D = " << std::fixed << std::setprecision(5) << std::setw(5) << w << std::endl;
 	}
-	std::cerr << "Landscape has " << landscapeSimDists.size() << " evaluation points." << std::endl;
 
-	// Determine the point estimate from the landscape: sort data once and
-	// scan all landscape entries with the same procedure the bootstrap uses,
-	// so the point estimate and CI are guaranteed to be consistent.
-	std::vector<double> data_max_sorted = data_maxDists;
-	std::sort(data_max_sorted.begin(), data_max_sorted.end());
-
+	// Determine the point estimate from the landscape using the same energy distance
+	// as the bootstrap so that the point estimate and CI are consistent.
 	double bestFr = 0.0;
 	double bestW = std::numeric_limits<double>::max();
 	double bestIOD = 0.0;
 	for (const auto &lp : landscapeSimDists) {
-		double w = wassersteinPresorted(lp.second.sortedMax, data_max_sorted) / meanMax;
-		if (w < bestW) {
-			bestW = w;
+		double e = energyDistancePresorted(lp.second.sortedMax, lp.second.simSelfTermMax, data_max_sorted, dataMaxSelfTerm, dataMaxTotal) / meanMax;
+		if (e < bestW) {
+			bestW = e;
 			bestFr = lp.first;
 			bestIOD = lp.second.medianIOD;
 		}
 	}
 	std::cerr << "Optimal: fr = " << std::scientific << std::setprecision(3) << bestFr
 			  << "  IOD = " << std::fixed << std::setprecision(0) << bestIOD
-			  << "  W = " << std::fixed << std::setprecision(3) << bestW << std::endl;
+			  << "  E = " << std::fixed << std::setprecision(5) << bestW << std::endl;
 
 	// Evaluate at the optimum to get sim distributions for output
 	std::pair<std::vector<double>, std::vector<double>> bestSimDist;
@@ -1017,6 +1069,29 @@ int iod_main(int argc, char** argv) {
 	double iodFinal;
 	objective(bestFr, iodFinal);
 	saveSimDist = nullptr;
+
+	// Pre-fit a smooth log(IOD) ~ log(fr) model to all landscape points.
+	double iodFitSlope = -1.0, iodFitIntercept = 0.0;
+	{
+		double sumX = 0.0, sumY = 0.0, sumXX = 0.0, sumXY = 0.0;
+		int nFit = 0;
+		for (const auto& lp : landscapeSimDists) {
+			if (lp.second.medianIOD > 0.0) {
+				double lx = std::log10(lp.first);
+				double ly = std::log10(lp.second.medianIOD);
+				sumX += lx;  sumY += ly;
+				sumXX += lx * lx;  sumXY += lx * ly;
+				nFit++;
+			}
+		}
+		if (nFit >= 2) {
+			double fitDenom = nFit * sumXX - sumX * sumX;
+			if (fitDenom != 0.0) {
+				iodFitSlope     = (nFit * sumXY - sumX * sumY) / fitDenom;
+				iodFitIntercept = (sumY - iodFitSlope * sumX) / nFit;
+			}
+		}
+	}
 
 	// Bootstrap CI: resample the observed data and find the best landscape point for each resample
 	const int nBootstrap = 10000;
@@ -1044,8 +1119,6 @@ int iod_main(int argc, char** argv) {
 		return p;
 	};
 
-	SmoothParams sp1 = computeSmoothParams(data_behindDists);
-	SmoothParams sp2 = computeSmoothParams(data_aheadDists);
 	SmoothParams spMax = computeSmoothParams(data_maxDists);
 
 	for (int b = 0; b < nBootstrap; b++) {
@@ -1064,14 +1137,15 @@ int iod_main(int argc, char** argv) {
 		}
 		std::sort(bootMax.begin(), bootMax.end());
 
-		// Compute combined Wasserstein distance at each landscape point for this bootstrap sample
-		std::vector<std::pair<double, double>> bootLandscape; // (log10(fr), W)
-		std::vector<std::pair<double, double>> iodLandscape;  // (log10(fr), IOD)
+		// Compute energy distance at each landscape point for this bootstrap sample.
+		// Precompute self-term and total for bootMax once per iteration.
+		double bootMaxSelfTerm = sortedSelfTerm(bootMax);
+		double bootMaxTotal = std::accumulate(bootMax.begin(), bootMax.end(), 0.0);
+		std::vector<std::pair<double, double>> bootLandscape; // (log10(fr), E)
 		for (const auto& lp : landscapeSimDists) {
 			double logFr = std::log10(lp.first);
-			double w = wassersteinPresorted(lp.second.sortedMax, bootMax) / meanMax;
-			bootLandscape.push_back({logFr, w});
-			iodLandscape.push_back({logFr, lp.second.medianIOD});
+			double e = energyDistancePresorted(lp.second.sortedMax, lp.second.simSelfTermMax, bootMax, bootMaxSelfTerm, bootMaxTotal) / meanMax;
+			bootLandscape.push_back({logFr, e});
 		}
 
 		// Find the index of the minimum W
@@ -1080,41 +1154,31 @@ int iod_main(int argc, char** argv) {
 			if (bootLandscape[i].second < bootLandscape[minIdx].second) minIdx = i;
 		}
 
-		// Fit a quadratic to the minimum and its neighbours to interpolate
-		double bootIOD;
-		if (minIdx > 0 && minIdx < bootLandscape.size() - 1) {
-			double x0 = bootLandscape[minIdx - 1].first, w0 = bootLandscape[minIdx - 1].second;
-			double x1 = bootLandscape[minIdx].first,     w1 = bootLandscape[minIdx].second;
-			double x2 = bootLandscape[minIdx + 1].first, w2 = bootLandscape[minIdx + 1].second;
+		// Fit a quadratic to the minimum and its neighbours to find xStar
+		// (the sub-grid optimal log10(fr) for this bootstrap sample), then
+		// evaluate IOD via the pre-fitted smooth log(IOD)~log(fr) model.
+		double xStar_boot = bootLandscape[minIdx].first; // default: grid point
+		if (minIdx > 0 && minIdx < bootLandscape.size() - 1
+		    && bootLandscape[minIdx - 1].second > 0.0
+		    && bootLandscape[minIdx].second > 0.0
+		    && bootLandscape[minIdx + 1].second > 0.0) {
+				
+			// Work in log(E) space so that the parabola vertex is scale-invariant.
+			double x0 = bootLandscape[minIdx - 1].first, w0 = std::log(bootLandscape[minIdx - 1].second);
+			double x1 = bootLandscape[minIdx].first,     w1 = std::log(bootLandscape[minIdx].second);
+			double x2 = bootLandscape[minIdx + 1].first, w2 = std::log(bootLandscape[minIdx + 1].second);
 
 			// Vertex of parabola through (x0,w0), (x1,w1), (x2,w2)
 			double denom = (x0 - x1) * (x0 - x2) * (x1 - x2);
-			double a = (x2 * (w1 - w0) + x1 * (w0 - w2) + x0 * (w2 - w1)) / denom;
+			double a_quad = (x2 * (w1 - w0) + x1 * (w0 - w2) + x0 * (w2 - w1)) / denom;
 
-			if (a > 0) {
-				double b = (x2 * x2 * (w0 - w1) + x1 * x1 * (w2 - w0) + x0 * x0 * (w1 - w2)) / denom;
-				double xStar = -b / (2.0 * a);
-
+			if (a_quad > 0) {
+				double b_quad = (x2 * x2 * (w0 - w1) + x1 * x1 * (w2 - w0) + x0 * x0 * (w1 - w2)) / denom;
 				// Clamp to the bracket to avoid extrapolation
-				xStar = std::max(x0, std::min(x2, xStar));
-
-				// Linearly interpolate IOD at xStar
-				double iod0 = iodLandscape[minIdx - 1].second;
-				double iod1_val = iodLandscape[minIdx].second;
-				double iod2 = iodLandscape[minIdx + 1].second;
-				if (xStar <= x1) {
-					double t = (x1 - x0 > 0) ? (xStar - x0) / (x1 - x0) : 0.0;
-					bootIOD = iod0 + t * (iod1_val - iod0);
-				} else {
-					double t = (x2 - x1 > 0) ? (xStar - x1) / (x2 - x1) : 0.0;
-					bootIOD = iod1_val + t * (iod2 - iod1_val);
-				}
-			} else {
-				bootIOD = iodLandscape[minIdx].second;
+				xStar_boot = std::max(x0, std::min(x2, -b_quad / (2.0 * a_quad)));
 			}
-		} else {
-			bootIOD = iodLandscape[minIdx].second;
 		}
+		double bootIOD = std::pow(10.0, iodFitIntercept + iodFitSlope * xStar_boot);
 
 		bootstrapIODs.push_back(bootIOD);
 	}
@@ -1127,7 +1191,7 @@ int iod_main(int argc, char** argv) {
 	std::cerr << "Summary:" << std::endl;
 	std::cerr << "--------- " << std::endl;
 	std::cerr << "Optimal fr = " << std::scientific << std::setprecision(3) << bestFr << std::endl;
-	std::cerr << "Wasserstein distance = " << std::fixed << std::setprecision(3) << bestW << std::endl;
+	std::cerr << "Energy distance = " << std::fixed << std::setprecision(3) << bestW << std::endl;
 	std::cerr << "Median IOD = " << std::fixed << std::setprecision(0) << bestIOD << " kb" << std::endl;
 	std::cerr << "95% confidence interval: [" << std::fixed << std::setprecision(0) << ciLow << " kb , " << std::fixed << std::setprecision(0) << ciHigh << " kb]" << std::endl;
 
@@ -1148,7 +1212,7 @@ int iod_main(int argc, char** argv) {
 	outFile << "#Commit " << std::string(getGitCommit()) << "\n";
 	outFile << "#MeanForkSpeed " << std::fixed << std::setprecision(3) << avgForkSpeed << "\n";
 	outFile << "#OptimalFiringRate " << std::scientific << std::setprecision(6) << bestFr << "\n";
-	outFile << "#WassersteinDistance " << std::fixed << std::setprecision(6) << bestW << "\n";
+	outFile << "#EnergyDistance " << std::fixed << std::setprecision(6) << bestW << "\n";
 	outFile << "#MedianIOD " << std::fixed << std::setprecision(1) << bestIOD << "\n";
 	outFile << "#95ConfidenceInterval " << std::fixed << std::setprecision(1) << ciLow << " " << ciHigh << "\n";
 	outFile << ">DataBehindDistances:\n";

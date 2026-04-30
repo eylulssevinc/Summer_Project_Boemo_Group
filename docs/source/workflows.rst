@@ -105,6 +105,15 @@ If we've used an agent that targets the DNA damage response, or if we're working
 
 The resulting file, ``output.seeBreaks``, will contain statistics on the number of analogue tracks that terminate at read ends compared to the number that would be expected by chance. In particular, it includes a 95% confidence interval on the difference between observed and expected values. We would generally say breaking is elevated if zero lies outside this interval. You can see an example in the :ref:`cookbook` of how to parse and plot the distributions of expected and observed values.
 
+We might also be interested in inter-origin distance, the spacing between fired replication origins, which is an important marker of replication stress. Suppose the duration of our first analogue pulse was 5 minutes and the second analogue pulse was 10 minutes. We can do this by passing the pulse durations (in minutes) along with theresults of ``DNAscent detect`` and ``DNAscent forkSense`` to ``DNAscent meIODy``:
+
+.. code-block:: console
+
+   DNAscent meIODy -l leftForks_DNAscent_forkSense.bed -r rightForks_DNAscent_forkSense.bed --origin origins_DNAscent_forkSense.bed --termination terminations_DNAscent_forkSense.bed -d detect_output.bam --tPulse1 5. --tPulse2 10. -o output.IOD
+
+The resulting file, ``output.IOD``, will contain statistics on the inter-origin distance, including the median IOD and a 95% confidence interval. You can see an example in the :ref:`meIODy` of how to visualise your results.
+
+
 Barcoding
 ---------
 

@@ -847,6 +847,12 @@ int align_main( int argc, char** argv ){
 
 				DNAscent::read r(buffer[i], bam_hdr, readID2path, reference);
 
+				if (r.refMismatch){
+
+					std::cerr << std::endl << "Error: contig '" << r.referenceMappedTo << "' found in BAM file but not in the reference genome." << std::endl;
+					std::cerr << "Please check that the reference genome passed with -r matches the one used for alignment." << std::endl;
+					exit(1);
+				}
 				if (r.missing){
 
 					std::lock_guard<std::mutex> lock(mtx);

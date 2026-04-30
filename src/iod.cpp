@@ -71,91 +71,6 @@ static const char *help=
 "Please submit bug reports to GitHub Issues (https://github.com/MBoemo/DNAscent/issues).";
 
 
-double wasserstein(std::vector<double> a, std::vector<double> b) {
-
-	std::sort(a.begin(), a.end());
-	std::sort(b.begin(), b.end());
-
-	size_t n = a.size();
-	size_t m = b.size();
-
-	// 1-Wasserstein distance: integral of |F_a(x) - F_b(x)| dx
-	double totalDist = 0.0;
-	size_t i = 0, j = 0;
-	double prevCDF_a = 0.0, prevCDF_b = 0.0;
-	double prevVal = 0.0;
-	bool first = true;
-
-	while (i < n || j < m) {
-
-		double val;
-		if (i < n && (j >= m || a[i] <= b[j])) {
-			val = a[i];
-		} else {
-			val = b[j];
-		}
-
-		if (!first) {
-			double diff = prevCDF_a - prevCDF_b;
-			totalDist += std::abs(diff) * (val - prevVal);
-		}
-		first = false;
-
-		while (i < n && a[i] == val) {
-			prevCDF_a += 1.0 / n;
-			i++;
-		}
-		while (j < m && b[j] == val) {
-			prevCDF_b += 1.0 / m;
-			j++;
-		}
-		prevVal = val;
-	}
-
-	return totalDist;
-}
-
-
-double wassersteinPresorted(const std::vector<double> &a, const std::vector<double> &b) {
-
-	size_t n = a.size();
-	size_t m = b.size();
-
-	double totalDist = 0.0;
-	size_t i = 0, j = 0;
-	double prevCDF_a = 0.0, prevCDF_b = 0.0;
-	double prevVal = 0.0;
-	bool first = true;
-
-	while (i < n || j < m) {
-
-		double val;
-		if (i < n && (j >= m || a[i] <= b[j])) {
-			val = a[i];
-		} else {
-			val = b[j];
-		}
-
-		if (!first) {
-			double diff = prevCDF_a - prevCDF_b;
-			totalDist += std::abs(diff) * (val - prevVal);
-		}
-		first = false;
-
-		while (i < n && a[i] == val) {
-			prevCDF_a += 1.0 / n;
-			i++;
-		}
-		while (j < m && b[j] == val) {
-			prevCDF_b += 1.0 / m;
-			j++;
-		}
-		prevVal = val;
-	}
-
-	return totalDist;
-}
-
 
 // E|X-X'| for a sorted array a: (2/n^2) * sum_i a[i] * (2*i + 1 - n), 0-indexed.
 // This is the self-term used in the energy distance.
@@ -170,9 +85,7 @@ double sortedSelfTerm(const std::vector<double> &a) {
 }
 
 // Energy distance E(F,G) = 2*E|X-Y| - E|X-X'| - E|Y-Y'| between two 1-D distributions
-// given presorted sample arrays.  The cross-term E|X-Y| is evaluated in O(n+m) via a
-// merge sweep.  simSelfTerm = sortedSelfTerm(sim), dataSelfTerm = sortedSelfTerm(data),
-// dataTotal = sum of data elements (passed precomputed to avoid redundant work in hot loops).
+// given presorted sample arrays
 double energyDistancePresorted(const std::vector<double> &sim, double simSelfTerm,
                                const std::vector<double> &data, double dataSelfTerm,
                                double dataTotal) {
@@ -720,17 +633,18 @@ void getIgnoreIDs(std::string fileInput, std::vector<std::string> &ignoreIDs) {
 }
 
 
+struct ForkInfo {
+	int pulse5Prime;
+	int pulse3Prime;
+	int direction;  // +1 (rightward) or -1 (leftward)
+	int readStart;  // 5' read boundary
+	int readEnd;    // 3' read boundary
+};
+
+
 std::pair<std::vector<double>, std::vector<double>> calcSingleForkDistances(
 	const std::string &leftForkFile,
 	const std::string &rightForkFile) {
-
-	struct ForkInfo {
-		int pulse5Prime;
-		int pulse3Prime;
-		int direction;  // +1 (rightward) or -1 (leftward)
-		int readStart;  // 5' read boundary
-		int readEnd;    // 3' read boundary
-	};
 
 	// Group forks by readID
 	std::map<std::string, std::vector<ForkInfo>> readForks;
@@ -857,6 +771,15 @@ void bamReadlength(std::string filename, std::vector<int> &readLengths) {
 	hts_close(bam_fh);
 }
 
+// Struct to store precomputed simulation distributions and median IOD for a given firing rate to avoid recomputation in the bootstrap
+struct LandscapeEntry {
+	std::vector<double> sortedMax;
+	std::vector<double> sortedBehind;
+	std::vector<double> sortedAhead;
+	double medianIOD;
+	double simSelfTermMax; // sortedSelfTerm(sortedMax), precomputed to avoid recomputation in bootstrap
+};
+
 
 int iod_main(int argc, char** argv) {
 
@@ -906,22 +829,18 @@ int iod_main(int argc, char** argv) {
         bamReadlength(args.DetectInput, readLengths);       
     }
 
+	// Number of Gillespie simulations to run
+	// In testing, 50000 was plenty to remove noise
 	int nSims = 50000; 
+
 	unsigned int seed = 42;
 	std::pair<std::vector<double>, std::vector<double>> *saveSimDist = nullptr;
 	std::vector<std::tuple<double, double, double>> landscapePoints; // (fr, IOD, W)
 	const size_t MAX_LANDSCAPE_SAMPLES = 50000;
 
-	struct LandscapeEntry {
-		std::vector<double> sortedMax;
-		std::vector<double> sortedBehind;
-		std::vector<double> sortedAhead;
-		double medianIOD;
-		double simSelfTermMax; // sortedSelfTerm(sortedMax), precomputed to avoid recomputation in bootstrap
-	};
 	std::map<double, LandscapeEntry> landscapeSimDists; // fr -> stored sim distributions + median IOD
 
-	// Objective function: run simulations at a given fr and return combined Wasserstein distance to data
+	// Objective function: run simulations at a given fr and return distance to data
 	auto objective = [&](double fr, double &medianIOD) -> double {
 		std::vector<double> sim_behindDists;
 		std::vector<double> sim_aheadDists;
@@ -1005,6 +924,7 @@ int iod_main(int argc, char** argv) {
 	};
 
 	// Grid search in log10(fr) space: coarse pass across the full range, then a fine pass around the minimum.
+	// These ranges were tuned to account for a physiological range of fork speeds and IODs
 	double logFrMin = std::log10(1e-5);
 	double logFrMax = std::log10(1e-3);
 
@@ -1061,7 +981,7 @@ int iod_main(int argc, char** argv) {
 	}
 	std::cerr << "Optimal: fr = " << std::scientific << std::setprecision(3) << bestFr
 			  << "  IOD = " << std::fixed << std::setprecision(0) << bestIOD
-			  << "  E = " << std::fixed << std::setprecision(5) << bestW << std::endl;
+			  << "  D = " << std::fixed << std::setprecision(5) << bestW << std::endl;
 
 	// Evaluate at the optimum to get sim distributions for output
 	std::pair<std::vector<double>, std::vector<double>> bestSimDist;
@@ -1154,15 +1074,13 @@ int iod_main(int argc, char** argv) {
 			if (bootLandscape[i].second < bootLandscape[minIdx].second) minIdx = i;
 		}
 
-		// Fit a quadratic to the minimum and its neighbours to find xStar
-		// (the sub-grid optimal log10(fr) for this bootstrap sample), then
-		// evaluate IOD via the pre-fitted smooth log(IOD)~log(fr) model.
+		// Fit a quadratic to the minimum and its neighbours to find xStar and evaluate IOD via the pre-fitted smooth log(IOD)~log(fr) model
 		double xStar_boot = bootLandscape[minIdx].first; // default: grid point
 		if (minIdx > 0 && minIdx < bootLandscape.size() - 1
 		    && bootLandscape[minIdx - 1].second > 0.0
 		    && bootLandscape[minIdx].second > 0.0
 		    && bootLandscape[minIdx + 1].second > 0.0) {
-				
+
 			// Work in log(E) space so that the parabola vertex is scale-invariant.
 			double x0 = bootLandscape[minIdx - 1].first, w0 = std::log(bootLandscape[minIdx - 1].second);
 			double x1 = bootLandscape[minIdx].first,     w1 = std::log(bootLandscape[minIdx].second);

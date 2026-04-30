@@ -16,7 +16,7 @@ The algorithm will automatically tune itself to account for the read length dist
 Flow Cell Compatibility
 -----------------------
 
-As part of v4, ``DNAscent seeBreaks`` is naturally compatible with R10.4.1 data. However, unlike other v4 subprograms, ``DNAscent seeBreaks`` is backcompatible with legacy R9.4.1 flow cells. It is therefore perfectly acceptable to use ``DNAscent seeBreaks`` (v4.1.1) on the outputs of ``DNAscent detect`` (v3.1.2) and ``DNAscent forkSense`` (v3.1.2) generated from R9.4.1 data.
+As part of v4, ``DNAscent seeBreaks`` is naturally compatible with R10.4.1 data. However, unlike other v4 subprograms, ``DNAscent seeBreaks`` is backcompatible with legacy R9.4.1 flow cells. It is therefore perfectly acceptable to use ``DNAscent seeBreaks`` on the outputs of ``DNAscent detect`` (v3.1.2) and ``DNAscent forkSense`` (v3.1.2) generated from R9.4.1 data.
 
 Usage
 -----

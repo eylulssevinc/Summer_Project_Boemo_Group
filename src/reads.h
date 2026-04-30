@@ -205,6 +205,7 @@ namespace DNAscent {
 		size_t pod5_batch;
 		size_t pod5_row;
 		bool missing = false;
+		bool refMismatch = false;
 		
 		public:
 			read(bam1_t *record, bam_hdr_t *bam_hdr, std::map<std::string, IndexEntry> &readID2path, std::map<std::string, std::string> &reference){
@@ -271,6 +272,10 @@ namespace DNAscent {
 				}
 
 				//get the subsequence of the reference this read mapped to
+				if ( reference.count(referenceMappedTo) == 0 ){
+					refMismatch = true;
+					return;
+				}
 				referenceSeqMappedTo = reference.at(referenceMappedTo).substr(refStart, refEnd - refStart);
 
 				//fetch the basecall from the bam file

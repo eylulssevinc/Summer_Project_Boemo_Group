@@ -14,6 +14,7 @@ DNAscent
    index_exe
    detect
    forkSense
+   meIODy
    seeBreaks
    visualisation
    workflows
@@ -26,7 +27,7 @@ Overview
 
 DNAscent is software designed to detect the base analogues BrdU and EdU in Oxford Nanopore reads.  In an experimental setup where BrdU and EdU are incorporated into nascent DNA by replication forks, this software can be used to answer questions that were traditionally answered by DNA fibre analysis.  DNAscent can also call the genomic positions of stalled and stressed replication forks for use as a replication stress assay.
 
-DNAscent v4.1.1 supports sequencing data collected on Oxford Nanopore R10.4.1 flow cells. Users wishing to analyse data acquired on legacy R9.4.1 flow cells should roll back to DNAscent v3.1.2 as v4.1.1 is not back-compatible with R9.4.1 flow cells. As R9.4.1 flow cells have been deprecated by Oxford Nanopore,
+DNAscent v4.2.1 supports sequencing data collected on Oxford Nanopore R10.4.1 flow cells. Users wishing to analyse data acquired on legacy R9.4.1 flow cells should roll back to DNAscent v3.1.2 as v4.2.1 is not back-compatible with R9.4.1 flow cells. As R9.4.1 flow cells have been deprecated by Oxford Nanopore,
 previous versions of DNAscent designed for R9.4.1 flow cells (v3.1.2 and below) are no longer under active development.
 
 The Oxford Nanopore Flongle, MinION, GridION, and PromethION platforms are all supported.

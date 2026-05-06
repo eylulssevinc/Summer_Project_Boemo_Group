@@ -8,8 +8,8 @@ v4.2.1
 
 * Added new ``DNAscent meIODy`` executable which determines inter-origin distance from DNAscent data.
 * This new executable is compatible with both v3 and v4 detection/forkSense outputs, and hence is backcompatible with data produced on R9.4.1 flow cells.
-* Data to test this release was provided by `Mathew Jones <https://researchers.uq.edu.au/researcher/25051>`_, `Subash Rai <https://gih.uq.edu.au/profile/677/subash-rai>`_, and `David Cullen <https://frazer.uq.edu.au/profile/6348/david-cullen>`_ at the University of Queensland. We are always grateful for their long-term collaboration and we are particularly grateful to them for supporting the release of the software to the community ahead of publication.
-
+* Data to test ``DNAscent meIODy`` was provided by `Mathew Jones <https://researchers.uq.edu.au/researcher/25051>`_, `Subash Rai <https://gih.uq.edu.au/profile/677/subash-rai>`_, and `David Cullen <https://frazer.uq.edu.au/profile/6348/david-cullen>`_ at the University of Queensland. We would like to thank them again for being very supportive of the software and the community.
+* The minimum read length of ``DNAscent detect`` was relaxed from 1000 bp to 100 bp, as this was a frequently requested feature from users. We still advise caution when using DNAscent on very short reads, as it was designed from the ground up with long reads in mind.
 
 v4.1.1
 -----------------

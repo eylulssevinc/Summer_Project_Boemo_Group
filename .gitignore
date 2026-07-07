@@ -37,3 +37,6 @@ src/softwarepath.h
 
 #images
 *.sif
+
+gem_data/
+

@@ -19,6 +19,7 @@
 
 
 int align_main( int argc, char** argv );
-void eventalign( DNAscent::read &, unsigned int);
+void eventalign( DNAscent::read &, unsigned int, bool);
+bool hasSoftClipAtReferenceThreePrime( bam1_t * );
 
 #endif

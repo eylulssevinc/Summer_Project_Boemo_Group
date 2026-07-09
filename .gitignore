@@ -39,4 +39,5 @@ src/softwarepath.h
 *.sif
 
 gem_data/
+Eylul_gem_data/
 

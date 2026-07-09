@@ -516,6 +516,22 @@ std::cout << "Traceback terminated." << std::endl;
 }
 
 
+bool hasSoftClipAtReferenceThreePrime(bam1_t *record){
+
+	//BAM CIGAR is always stored in reference/genome coordinate order regardless of the
+	//read's mapped strand, so the reference's 3' end corresponds to the LAST cigar
+	//operation for a forward-mapped read and the FIRST cigar operation for a reverse-
+	//mapped read.
+	uint32_t n_cigar = record -> core.n_cigar;
+	if (n_cigar == 0) return false;
+
+	const uint32_t *cigar = bam_get_cigar(record);
+	int op = bam_is_rev(record) ? bam_cigar_op(cigar[0]) : bam_cigar_op(cigar[n_cigar - 1]);
+
+	return op == BAM_CSOFT_CLIP;
+}
+
+
 bool referenceDefined(std::string &readSnippet){
 
 	//make sure the read snippet is fully defined as A/T/G/C in reference
@@ -544,7 +560,7 @@ bool referenceDefined(std::string &readSnippet){
 }
 
 
-void eventalign( DNAscent::read &r, unsigned int totalWindowLength){
+void eventalign( DNAscent::read &r, unsigned int totalWindowLength, bool captureTailSignal){
 
 	int readHead = 0;
 	int runningInsertions = 0;
@@ -553,6 +569,12 @@ void eventalign( DNAscent::read &r, unsigned int totalWindowLength){
 	unsigned int k = Pore_Substrate_Config.kmer_len;
 
 	r.humanReadable_eventalignOut = ">" + r.readID + " " + r.referenceMappedTo + " " + std::to_string(r.refStart) + " " + std::to_string(r.refEnd) + " " + r.strand + "\n";
+
+	//raw scaled signal observed after the last reference-anchored 9-mer window - the pore
+	//model needs a full k-mer of context to centre a call, so nothing beyond that point ever
+	//gets a reference coordinate. This vector is where we stash it instead of dropping it;
+	//see the two collection sites below for the two distinct ways signal ends up here.
+	std::vector<double> tailSignal;
 
 	unsigned int reference_index = 0;
 	while ( reference_index < r.referenceSeqMappedTo.size() - k + 1){
@@ -618,18 +640,18 @@ void eventalign( DNAscent::read &r, unsigned int totalWindowLength){
 		bool firstMatch = true;
 		for ( unsigned int j = readHead; j < (r.eventAlignment).size(); j++ ){
 
-			//if an event has been aligned to a position in the window, add it 
+			//if an event has been aligned to a position in the window, add it
 			if ( (r.refToQuery)[reference_index] <= (r.eventAlignment)[j].second and (r.eventAlignment)[j].second < (r.refToQuery)[reference_index + windowLength - k + 1] ){
 
 				if (firstMatch){
 					readHead = j;
 					firstMatch = false;
 				}
-				
+
 				double event_mean = (r.events)[(r.eventAlignment)[j].first].mean;
-				
+
 				//guard on bad signal
-				if (0. < event_mean and event_mean < 250.){ 
+				if (0. < event_mean and event_mean < 250.){
 					eventSnippet_means.push_back(event_mean);
 					eventSnippet.push_back((r.events)[(r.eventAlignment)[j].first]);
 				}
@@ -678,6 +700,16 @@ void eventalign( DNAscent::read &r, unsigned int totalWindowLength){
 
 			if (label != "D") evIdx++; //silent states don't emit an event
 		}
+
+		//true only if this window's last match reaches the last valid k-mer in the whole
+		//read - equivalently, true only if the outer while loop is about to terminate for
+		//good after this window. windowLength reaching basesToEnd is NOT sufficient on its
+		//own: if Viterbi D-labels some trailing states in a window that nominally reached
+		//the end, lastM_ref falls short, reference_index only advances partway, and the
+		//outer loop runs again on the leftover - readHead does not skip past that leftover's
+		//events, so a genuinely-final-looking window here can still be followed by another
+		//real window that needs those same trailing events back.
+		bool reachedFinalKmer = (reference_index + lastM_ref + 1 >= r.referenceSeqMappedTo.size() - k + 1);
 
 		//do a second pass to print the alignment
 		evIdx = 0;
@@ -740,20 +772,64 @@ void eventalign( DNAscent::read &r, unsigned int totalWindowLength){
 				}
 
 			}
-			else if (label == "I" and evIdx < lastM_ev){ //don't print insertions after the last match because we're going to align these in the next segment
-				for (unsigned int idx_raw = 0; idx_raw < eventSnippet[evIdx].raw.size(); idx_raw++){
-					double scaledEvent = (eventSnippet[evIdx].raw[idx_raw] - r.scalings.shift) / r.scalings.scale;
-					r.humanReadable_eventalignOut += std::to_string(event_coord) + "\t" + kmerRef + "\t" + std::to_string(scaledEvent) + "\t" + std::string(k, 'N') + "\t" + "0" + "\n";
+			else if (label == "I"){
+
+				//insertions after the last match don't get printed against a reference
+				//coordinate because normally the next window picks them up. For the
+				//terminal window there is no next window - Viterbi still routed these
+				//events somewhere (there's no other state left for it to put them in),
+				//it's just that "somewhere" is signal from past the end of the modelled
+				//region, so route it to the TAIL pool instead of dropping it.
+				bool isTrailingInsertion = (evIdx >= lastM_ev);
+
+				if ( (not isTrailingInsertion) or (reachedFinalKmer and captureTailSignal) ){
+
+					for (unsigned int idx_raw = 0; idx_raw < eventSnippet[evIdx].raw.size(); idx_raw++){
+						double scaledEvent = (eventSnippet[evIdx].raw[idx_raw] - r.scalings.shift) / r.scalings.scale;
+
+						if (isTrailingInsertion) tailSignal.push_back(scaledEvent);
+						else r.humanReadable_eventalignOut += std::to_string(event_coord) + "\t" + kmerRef + "\t" + std::to_string(scaledEvent) + "\t" + std::string(k, 'N') + "\t" + "0" + "\n";
+					}
+					runningInsertions++;
 				}
-				runningInsertions++;
 			}
-			
+
 			evIdx ++;
 		}
 
 		//go again starting at posOnRef + lastM_ref using events starting at readHead + lastM_ev
 		readHead += lastM_ev + 1;
 		reference_index += lastM_ref + 1;
+	}
+
+	//a second, distinct pool of tail signal: events that never made it into r.eventAlignment
+	//at all. The adaptive banded alignment (event_handling.cpp, adaptive_banded_simple_event_align)
+	//picks a best-scoring final event index and "trims" (silently discards) anything after it
+	//rather than force-matching it to the last k-mer if that scores worse than trimming -
+	//exactly the situation we'd expect if a modified base right at the end of the molecule
+	//makes the tail signal look unlike the last unmodified k-mer. Those events are otherwise
+	//invisible to this function, since everything above only ever walks r.eventAlignment.
+	if ( captureTailSignal and r.eventAlignment.size() > 0 ){
+
+		size_t lastAlignedEvent = r.eventAlignment.back().first;
+		for ( size_t evi = lastAlignedEvent + 1; evi < r.events.size(); evi++ ){
+
+			double event_mean = r.events[evi].mean;
+			if ( not (0. < event_mean and event_mean < 250.) ) continue; //same signal guard used when gathering eventSnippet above
+
+			for ( unsigned int idx_raw = 0; idx_raw < r.events[evi].raw.size(); idx_raw++ ){
+				double scaledEvent = (r.events[evi].raw[idx_raw] - r.scalings.shift) / r.scalings.scale;
+				tailSignal.push_back(scaledEvent);
+			}
+		}
+	}
+
+	//tailSignal is in chronological order: any trailing-insertion events collected in the
+	//terminal window above, followed by any events trimmed before eventAlignment even began.
+	//No reference coordinate is meaningful here, so lead with a non-numeric marker (existing
+	//parsers that blindly do int(fields[0]) on every line will need to skip "TAIL" lines first).
+	for ( size_t i = 0; i < tailSignal.size(); i++ ){
+		r.humanReadable_eventalignOut += "TAIL\t" + std::to_string(i) + "\t" + std::to_string(tailSignal[i]) + "\n";
 	}
 
 	r.QCpassed = true;
@@ -888,7 +964,17 @@ int align_main( int argc, char** argv ){
 					continue;
 				}
 
-				eventalign(r, Pore_Substrate_Config.windowLength_align);
+				//only trust signal past the end of the modelled region if this read is
+				//forward-mapped, its alignment actually reaches the true 3' end of the
+				//reference contig, and there's no 3' soft clip - a 3' soft clip here would
+				//mean the physical molecule kept going past our reference (e.g. extra
+				//ligated sequence), so what follows isn't unambiguously "past position N
+				//of our construct."
+				bool captureTailSignal = (r.strand == "fwd")
+				                          and (r.refEnd == (int) reference.at(r.referenceMappedTo).size())
+				                          and not hasSoftClipAtReferenceThreePrime(r.record);
+
+				eventalign(r, Pore_Substrate_Config.windowLength_align, captureTailSignal);
 
 				if (not r.QCpassed){
 					failed++;

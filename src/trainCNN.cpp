@@ -325,14 +325,14 @@ int data_main( int argc, char** argv ){
 				}
 				
 				//do a first event alignment to make DNN input tensors
-				eventalign( r, Pore_Substrate_Config.windowLength_align);
-				
+				eventalign( r, Pore_Substrate_Config.windowLength_align, false);
+
 				//run analogue prediction
 				if (args.useHMM) llAcrossRead(r, 12);
 				else runCNN(r,session,inputOps, true);
-				
+
 				//clear the read and re-annotate wtih the DNN analogue predictions
-				eventalign(r, Pore_Substrate_Config.windowLength_align);				
+				eventalign(r, Pore_Substrate_Config.windowLength_align, false);
 
 				if (not r.QCpassed){
 					failed++;

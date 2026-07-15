@@ -1,0 +1,5 @@
+=== job start: Thu Jul  9 17:15:02 +03 2026 ===
+host: ag01.kuvalar.ku.edu.tr
+job ID: 1331372
+cpus-per-task: 8
+dataset: unset

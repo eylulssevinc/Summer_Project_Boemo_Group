@@ -27,6 +27,7 @@
 #include "fast5.h"
 #include "config.h"
 #include <mutex>
+#include <algorithm>
 
 static const char *help=
 "align: DNAscent executable that generates a BrdU- and EdU-aware event alignment.\n"
@@ -41,7 +42,12 @@ static const char *help=
 "  -t,--threads              number of threads (default is 1 thread),\n"
 "  -m,--maxReads             maximum number of reads to consider,\n"
 "  -q,--quality              minimum mapping quality (default is 20),\n"
-"  -l,--length               minimum read length in bp (default is 100).\n"
+"  -l,--length               minimum read length in bp (default is 100),\n"
+"  --tail-source             which recovered 3' tail signal (past the last full\n"
+"                             reference k-mer) to print, for reads that pass the\n"
+"                             tail-capture gate (forward-mapped, alignment reaches\n"
+"                             the true reference end, no 3' soft clip): none,\n"
+"                             source1, source2, or both (default is none).\n"
 "DNAscent is under active development by the Boemo Group, Department of Pathology, University of Cambridge (https://www.boemogroup.org/).\n"
 "Please submit bug reports to GitHub Issues (https://github.com/MBoemo/DNAscent/issues).";
 
@@ -54,7 +60,18 @@ struct Arguments {
 	int minQ, maxReads;
 	int minL;
 	unsigned int threads;
+	TailCaptureMode tailSourceMode;
 };
+
+
+TailCaptureMode parseTailSourceArg( std::string s ){
+
+	if (s == "none") return TailCaptureMode::NONE;
+	else if (s == "source1") return TailCaptureMode::SOURCE1;
+	else if (s == "source2") return TailCaptureMode::SOURCE2;
+	else if (s == "both") return TailCaptureMode::BOTH;
+	else throw InvalidOption( "--tail-source " + s );
+}
 
 Arguments parseAlignArguments( int argc, char** argv ){
 
@@ -83,6 +100,7 @@ Arguments parseAlignArguments( int argc, char** argv ){
 	args.minL = 100;
 	args.capReads = false;
 	args.maxReads = 0;
+	args.tailSourceMode = TailCaptureMode::NONE;
 
 	/*parse the command line arguments */
 
@@ -155,11 +173,98 @@ Arguments parseAlignArguments( int argc, char** argv ){
 			args.maxReads = std::stoi( strArg.c_str() );
 			i+=2;
 		}
+		else if ( flag == "--tail-source" ){
+
+			if (i == argc-1) throw TrailingFlag(flag);
+
+			std::string strArg( argv[ i + 1 ] );
+			args.tailSourceMode = parseTailSourceArg( strArg );
+			i+=2;
+		}
 		else throw InvalidOption( flag );
 	}
 	if (args.outputFilename == args.indexFilename or args.outputFilename == args.referenceFilename or args.outputFilename == args.bamFilename) throw OverwriteFailure();
 
 	return args;
+}
+
+
+//counts how many TAIL_SOURCE1/TAIL_SOURCE2/NEXT100EVT lines eventalign() appended to one
+//read's output block - used only for the --tail-source terminal summary in align_main.
+//This necessarily reflects what the current --tail-source mode actually captured/printed
+//for this run, not what signal exists in principle (e.g. under --tail-source source1, a
+//read's Source 2 count here will always read zero even if that read has real Source 2
+//signal, because it was never collected this run).
+void countTailLines(const std::string &out, long &n1, long &n2, long &n3){
+
+	n1 = 0;
+	n2 = 0;
+	n3 = 0;
+	size_t pos = 0;
+	while ( (pos = out.find('\n', pos)) != std::string::npos ){
+
+		size_t lineStart = pos + 1;
+		if (out.compare(lineStart, 12, "TAIL_SOURCE1") == 0) n1++;
+		else if (out.compare(lineStart, 12, "TAIL_SOURCE2") == 0) n2++;
+		else if (out.compare(lineStart, 10, "NEXT100EVT") == 0) n3++;
+		pos = lineStart;
+	}
+}
+
+
+std::string tailCaptureModeToString(TailCaptureMode m){
+
+	switch(m){
+		case TailCaptureMode::NONE: return "none";
+		case TailCaptureMode::SOURCE1: return "source1";
+		case TailCaptureMode::SOURCE2: return "source2";
+		case TailCaptureMode::BOTH: return "both";
+		default: return "unknown";
+	}
+}
+
+
+//min/median/mean/max of a per-read tail-length distribution, for the end-of-run
+//--tail-source summary. Empty input (no reads had that source this run) is reported
+//explicitly rather than printing meaningless statistics.
+void printTailLengthSummary(const std::string &label, std::vector<long> lengths){
+
+	if (lengths.empty()){
+		std::cout << "  " << label << ": 0 reads" << std::endl;
+		return;
+	}
+	std::sort(lengths.begin(), lengths.end());
+	double sum = 0.;
+	for (long v : lengths) sum += v;
+	double mean = sum / lengths.size();
+	long median = lengths[lengths.size() / 2];
+	std::cout << "  " << label << ": " << lengths.size() << " reads, min=" << lengths.front()
+	           << " median=" << median << " mean=" << mean << " max=" << lengths.back() << std::endl;
+}
+
+
+//called from both align_main exit points (the early return under -m/--maxReads, and the
+//normal end-of-BAM return) so the summary always prints regardless of which one is hit.
+void printTailCaptureSummary(TailCaptureMode mode, long readsPassingTailGate,
+                              long readsWithSource1, long readsWithSource2, long readsWithNext100,
+                              long totalSource1Samples, long totalSource2Samples, long totalNext100Samples,
+                              const std::vector<long> &source1Lengths,
+                              const std::vector<long> &source2Lengths,
+                              const std::vector<long> &next100Lengths){
+
+	std::cout << std::endl << "Tail-source capture summary (--tail-source "
+	          << tailCaptureModeToString(mode) << "):" << std::endl;
+	std::cout << "  reads passing tail gate (forward-mapped, reaches true ref end, no 3' soft clip): "
+	          << readsPassingTailGate << std::endl;
+	std::cout << "  reads with Source 1 signal printed this run: " << readsWithSource1
+	          << ", total Source 1 samples: " << totalSource1Samples << std::endl;
+	std::cout << "  reads with Source 2 signal printed this run: " << readsWithSource2
+	          << ", total Source 2 samples: " << totalSource2Samples << std::endl;
+	std::cout << "  reads with NEXT100EVT signal printed this run: " << readsWithNext100
+	          << ", total NEXT100EVT samples (event-mean granularity, <=100 events/read): " << totalNext100Samples << std::endl;
+	printTailLengthSummary("Source 1 tail length per read", source1Lengths);
+	printTailLengthSummary("Source 2 tail length per read", source2Lengths);
+	printTailLengthSummary("NEXT100EVT tail length per read", next100Lengths);
 }
 
 
@@ -560,7 +665,7 @@ bool referenceDefined(std::string &readSnippet){
 }
 
 
-void eventalign( DNAscent::read &r, unsigned int totalWindowLength, bool captureTailSignal){
+void eventalign( DNAscent::read &r, unsigned int totalWindowLength, TailCaptureMode tailMode){
 
 	int readHead = 0;
 	int runningInsertions = 0;
@@ -572,9 +677,26 @@ void eventalign( DNAscent::read &r, unsigned int totalWindowLength, bool capture
 
 	//raw scaled signal observed after the last reference-anchored 9-mer window - the pore
 	//model needs a full k-mer of context to centre a call, so nothing beyond that point ever
-	//gets a reference coordinate. This vector is where we stash it instead of dropping it;
-	//see the two collection sites below for the two distinct ways signal ends up here.
-	std::vector<double> tailSignal;
+	//gets a reference coordinate. Two distinct mechanisms feed signal in here (see the two
+	//collection sites below), so they're kept in separate buffers rather than one combined
+	//pool: Source 1 (terminal-window trailing insertions from the reference-based Viterbi
+	//HMM) and Source 2 (events the rough, basecall-level aligner trimmed before eventalign
+	//ever saw them, often much larger than Source 1 - see TAIL_SIGNAL_CAPTURE.md). Each
+	//source is only collected if tailMode actually asks for it, so requesting just one
+	//source skips the other's collection work entirely rather than gathering-then-discarding.
+	bool wantSource1 = (tailMode == TailCaptureMode::SOURCE1 or tailMode == TailCaptureMode::BOTH);
+	bool wantSource2 = (tailMode == TailCaptureMode::SOURCE2 or tailMode == TailCaptureMode::BOTH);
+	std::vector<double> tailSignalSource1;
+	std::vector<double> tailSignalSource2;
+
+	//PI-proposed anchor: eventIndeces[lastM_ev] from the LAST window processed below -
+	//the raw r.events index of the last event the HMM actually matched to a reference
+	//k-mer (not merely the last event the rough aligner touched, which is what Source 2
+	//uses and can be later if the terminal window's HMM assigned any trailing events as
+	//"I" rather than extending the match). Overwritten unconditionally every iteration,
+	//so after the loop below it holds whatever the LAST iteration computed.
+	size_t lastMatchRawIdx = 0;
+	bool haveLastMatchRawIdx = false;
 
 	unsigned int reference_index = 0;
 	while ( reference_index < r.referenceSeqMappedTo.size() - k + 1){
@@ -635,6 +757,12 @@ void eventalign( DNAscent::read &r, unsigned int totalWindowLength, bool capture
 
 		std::vector< double > eventSnippet_means;
 		std::vector< event > eventSnippet;
+		//PI-proposed tracking: same length as eventSnippet_means/eventSnippet, holding
+		//each entry's index into r.events (the read's full, 5'->3' event vector) - lets
+		//us translate a LOCAL position within this window's Viterbi output (e.g. lastM_ev
+		//below) back into a raw index in the full per-read event vector, which eventSnippet
+		//itself discards.
+		std::vector< size_t > eventIndeces;
 
 		//get the events that correspond to the read snippet
 		bool firstMatch = true;
@@ -654,6 +782,7 @@ void eventalign( DNAscent::read &r, unsigned int totalWindowLength, bool capture
 				if (0. < event_mean and event_mean < 250.){
 					eventSnippet_means.push_back(event_mean);
 					eventSnippet.push_back((r.events)[(r.eventAlignment)[j].first]);
+					eventIndeces.push_back((r.eventAlignment)[j].first);
 				}
 			}
 
@@ -699,6 +828,13 @@ void eventalign( DNAscent::read &r, unsigned int totalWindowLength, bool capture
 			}
 
 			if (label != "D") evIdx++; //silent states don't emit an event
+		}
+
+		//translate this window's local lastM_ev back into a raw r.events index - see
+		//lastMatchRawIdx's declaration above the outer while loop.
+		if (not eventIndeces.empty()){
+			lastMatchRawIdx = eventIndeces[lastM_ev];
+			haveLastMatchRawIdx = true;
 		}
 
 		//true only if this window's last match reaches the last valid k-mer in the whole
@@ -782,12 +918,12 @@ void eventalign( DNAscent::read &r, unsigned int totalWindowLength, bool capture
 				//region, so route it to the TAIL pool instead of dropping it.
 				bool isTrailingInsertion = (evIdx >= lastM_ev);
 
-				if ( (not isTrailingInsertion) or (reachedFinalKmer and captureTailSignal) ){
+				if ( (not isTrailingInsertion) or (reachedFinalKmer and wantSource1) ){
 
 					for (unsigned int idx_raw = 0; idx_raw < eventSnippet[evIdx].raw.size(); idx_raw++){
 						double scaledEvent = (eventSnippet[evIdx].raw[idx_raw] - r.scalings.shift) / r.scalings.scale;
 
-						if (isTrailingInsertion) tailSignal.push_back(scaledEvent);
+						if (isTrailingInsertion) tailSignalSource1.push_back(scaledEvent);
 						else r.humanReadable_eventalignOut += std::to_string(event_coord) + "\t" + kmerRef + "\t" + std::to_string(scaledEvent) + "\t" + std::string(k, 'N') + "\t" + "0" + "\n";
 					}
 					runningInsertions++;
@@ -809,7 +945,7 @@ void eventalign( DNAscent::read &r, unsigned int totalWindowLength, bool capture
 	//exactly the situation we'd expect if a modified base right at the end of the molecule
 	//makes the tail signal look unlike the last unmodified k-mer. Those events are otherwise
 	//invisible to this function, since everything above only ever walks r.eventAlignment.
-	if ( captureTailSignal and r.eventAlignment.size() > 0 ){
+	if ( wantSource2 and r.eventAlignment.size() > 0 ){
 
 		size_t lastAlignedEvent = r.eventAlignment.back().first;
 		for ( size_t evi = lastAlignedEvent + 1; evi < r.events.size(); evi++ ){
@@ -819,17 +955,58 @@ void eventalign( DNAscent::read &r, unsigned int totalWindowLength, bool capture
 
 			for ( unsigned int idx_raw = 0; idx_raw < r.events[evi].raw.size(); idx_raw++ ){
 				double scaledEvent = (r.events[evi].raw[idx_raw] - r.scalings.shift) / r.scalings.scale;
-				tailSignal.push_back(scaledEvent);
+				tailSignalSource2.push_back(scaledEvent);
 			}
 		}
 	}
 
-	//tailSignal is in chronological order: any trailing-insertion events collected in the
-	//terminal window above, followed by any events trimmed before eventAlignment even began.
-	//No reference coordinate is meaningful here, so lead with a non-numeric marker (existing
-	//parsers that blindly do int(fields[0]) on every line will need to skip "TAIL" lines first).
-	for ( size_t i = 0; i < tailSignal.size(); i++ ){
-		r.humanReadable_eventalignOut += "TAIL\t" + std::to_string(i) + "\t" + std::to_string(tailSignal[i]) + "\n";
+	//a third, independent pool anchored at lastMatchRawIdx - the raw r.events index of
+	//the last event the HMM actually matched to a reference k-mer, in the last window
+	//processed above (PI-proposed anchor, eventIndeces[lastM_ev]). This is NOT always the
+	//same as Source 2's boundary (r.eventAlignment.back().first): if the terminal
+	//window's HMM assigned some trailing events as "I" (Source 1) rather than extending
+	//the match, those events sit BETWEEN lastMatchRawIdx and r.eventAlignment.back().first,
+	//so this window starts earlier than Source 2's and folds any Source 1 signal into its
+	//first entries. Reported at raw EVENT granularity (one value per event.mean) rather
+	//than expanded raw ADC samples, capped at the next 100 events.
+	std::vector<double> tailSignalNext100Events;
+	if ( (wantSource1 or wantSource2) and haveLastMatchRawIdx ){
+
+		size_t stop = std::min( r.events.size(), lastMatchRawIdx + 1 + 100 );
+		for ( size_t evi = lastMatchRawIdx + 1; evi < stop; evi++ ){
+
+			double event_mean = r.events[evi].mean;
+			if ( not (0. < event_mean and event_mean < 250.) ) continue; //same signal guard used elsewhere
+
+			double scaledEvent = (event_mean - r.scalings.shift) / r.scalings.scale;
+			tailSignalNext100Events.push_back(scaledEvent);
+		}
+	}
+
+	//Each buffer is independently in chronological order. No reference coordinate is
+	//meaningful for either source, so lines lead with a non-numeric marker (existing parsers
+	//that blindly do int(fields[0]) on every line need to skip these first). wantSource1/
+	//wantSource2 already encode exactly which mode(s) ask for which buffer, so printing just
+	//mirrors collection above. Source 1 is written before Source 2 when both are requested,
+	//matching the old combined buffer's chronological construction (terminal-window
+	//insertions first, then rough-alignment-trimmed events). NEXT100EVT deliberately does
+	//NOT start with "TAIL" - existing scripts key off a bare "TAIL" prefix to mean "legacy
+	//combined tail signal" and would otherwise silently double-count this pool as more of
+	//that same signal.
+	if (wantSource1){
+		for ( size_t i = 0; i < tailSignalSource1.size(); i++ ){
+			r.humanReadable_eventalignOut += "TAIL_SOURCE1\t" + std::to_string(i) + "\t" + std::to_string(tailSignalSource1[i]) + "\n";
+		}
+	}
+	if (wantSource2){
+		for ( size_t i = 0; i < tailSignalSource2.size(); i++ ){
+			r.humanReadable_eventalignOut += "TAIL_SOURCE2\t" + std::to_string(i) + "\t" + std::to_string(tailSignalSource2[i]) + "\n";
+		}
+	}
+	if (wantSource1 or wantSource2){
+		for ( size_t i = 0; i < tailSignalNext100Events.size(); i++ ){
+			r.humanReadable_eventalignOut += "NEXT100EVT\t" + std::to_string(i) + "\t" + std::to_string(tailSignalNext100Events[i]) + "\n";
+		}
 	}
 
 	r.QCpassed = true;
@@ -881,6 +1058,14 @@ int align_main( int argc, char** argv ){
 	pod5_init();
 
 	int failedEvents = 0;
+
+	//accumulated only inside the #pragma omp critical block below, alongside the existing
+	//outFile/prog/pb updates - see the terminal summary printed at the end of this function.
+	long readsPassingTailGate = 0;
+	long readsWithSource1 = 0, readsWithSource2 = 0, readsWithNext100 = 0;
+	long totalSource1Samples = 0, totalSource2Samples = 0, totalNext100Samples = 0;
+	std::vector<long> source1Lengths, source2Lengths, next100Lengths;
+
 	unsigned int maxBufferSize;
 	std::vector< bam1_t * > buffer;
 	if ( args.threads <= 4 ) maxBufferSize = args.threads;
@@ -970,11 +1155,16 @@ int align_main( int argc, char** argv ){
 				//mean the physical molecule kept going past our reference (e.g. extra
 				//ligated sequence), so what follows isn't unambiguously "past position N
 				//of our construct."
-				bool captureTailSignal = (r.strand == "fwd")
+				bool readPassesTailGate = (r.strand == "fwd")
 				                          and (r.refEnd == (int) reference.at(r.referenceMappedTo).size())
 				                          and not hasSoftClipAtReferenceThreePrime(r.record);
 
-				eventalign(r, Pore_Substrate_Config.windowLength_align, captureTailSignal);
+				//the gate above is a hard read-level requirement regardless of what the
+				//user asked for on the command line - a read that fails it never gets any
+				//tail signal printed, no matter which --tail-source mode is in effect.
+				TailCaptureMode effectiveTailMode = readPassesTailGate ? args.tailSourceMode : TailCaptureMode::NONE;
+
+				eventalign(r, Pore_Substrate_Config.windowLength_align, effectiveTailMode);
 
 				if (not r.QCpassed){
 					failed++;
@@ -987,6 +1177,28 @@ int align_main( int argc, char** argv ){
 					outFile << r.humanReadable_eventalignOut;
 					prog++;
 					pb.displayProgress( prog, failed, failedEvents );
+
+					if (readPassesTailGate){
+
+						readsPassingTailGate++;
+						long n1 = 0, n2 = 0, n3 = 0;
+						countTailLines(r.humanReadable_eventalignOut, n1, n2, n3);
+						if (n1 > 0){
+							readsWithSource1++;
+							totalSource1Samples += n1;
+							source1Lengths.push_back(n1);
+						}
+						if (n2 > 0){
+							readsWithSource2++;
+							totalSource2Samples += n2;
+							source2Lengths.push_back(n2);
+						}
+						if (n3 > 0){
+							readsWithNext100++;
+							totalNext100Samples += n3;
+							next100Lengths.push_back(n3);
+						}
+					}
 				}
 			}
 			buffer.clear();
@@ -996,6 +1208,10 @@ int align_main( int argc, char** argv ){
 			bam_destroy1(itr_record);
 			bam_hdr_destroy(bam_hdr);
 			hts_close(bam_fh);
+			printTailCaptureSummary(args.tailSourceMode, readsPassingTailGate, readsWithSource1,
+			                        readsWithSource2, readsWithNext100, totalSource1Samples,
+			                        totalSource2Samples, totalNext100Samples,
+			                        source1Lengths, source2Lengths, next100Lengths);
 			return 0;
 		}
 	}
@@ -1005,5 +1221,9 @@ int align_main( int argc, char** argv ){
 	std::cout << std::endl;
 	pod5_terminate();
 	logfile.close();
+	printTailCaptureSummary(args.tailSourceMode, readsPassingTailGate, readsWithSource1,
+	                        readsWithSource2, readsWithNext100, totalSource1Samples,
+	                        totalSource2Samples, totalNext100Samples,
+	                        source1Lengths, source2Lengths, next100Lengths);
 	return 0;
 }

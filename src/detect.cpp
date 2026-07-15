@@ -890,7 +890,7 @@ int detect_main( int argc, char** argv ){
 				if (args.useHMM) llAcrossRead(r, 12);
 				else{
 				
-					eventalign( r, Pore_Substrate_Config.windowLength_align, false);
+					eventalign( r, Pore_Substrate_Config.windowLength_align, TailCaptureMode::NONE);
 
 					if (not r.QCpassed){
 						failed++;

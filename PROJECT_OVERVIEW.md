@@ -929,6 +929,247 @@ whether the observed post-Match differences are visually apparent and whether
 they hold up under an actual read-level statistical check, rather than being
 read off IQR-band overlap.
 
+### 4.8 Time-warped post-Match analysis: which window to trust, dynamic time warping, and a ground-truth before/after comparison (added 2026-07-16)
+
+Everything below works from Source 1/2 unchanged and, following the PI's
+instruction, deliberately sets Source 1/2 aside — it is entirely about the
+`ALLAFTERM` ("events after the last M") pool from §4.7. No C++ code changed
+in this section; everything here is new Python analysis of the already-
+generated `.align` output.
+
+**4.8.1 Verifying the implementation against the PI's exact description.**
+The PI separately re-described the mechanism in more precise terms, citing
+specific upstream lines (commit `e830fe7b`, `reads.h:190,194`,
+`alignment.cpp:629,634`). Fetched and compared directly:
+- The reference↔read map ("genome alignment") is `r.refToQuery`/`queryToRef`
+  (`src/reads.h:192`, populated by `parseCigar` from the BAM record) and the
+  read↔events map ("rough event alignment") is `r.eventAlignment`
+  (`src/event_handling.cpp:149-422`) — confirmed to match the PI's
+  description of "a map between reference and read given by genome
+  alignment" and "a map between read and events given by the rough event
+  alignment" exactly.
+- The scaling formula the PI pointed to (upstream `alignment.cpp#L718`,
+  `scaledEvent = (raw - r.scalings.shift) / r.scalings.scale`) is identical,
+  verbatim, to what this codebase already applies to every rescued pool
+  (Source 1, Source 2, `NEXT100EVT`, `ALLAFTERM`) — same per-read
+  `PoreParameters` (`src/reads.h:188`), same formula, no divergence.
+- One deliberate divergence from a specific PI *suggestion* (not a
+  requirement): the PI floated "don't label these as insertions, label them
+  as something else, add it to the human-readable string." What's actually
+  implemented instead routes trailing insertions to a **separate buffer**
+  (`tailSignalSource1`, still internally Viterbi-labelled `"I"` — that part
+  wasn't changed) rather than inventing a new in-line state label, and prints
+  all four rescued pools as their own tagged blocks (`TAIL_SOURCE1`,
+  `TAIL_SOURCE2`, `NEXT100EVT`, `ALLAFTERM`) after the normal per-position
+  output, rather than embedding them into the reference-coordinate-anchored
+  string (which has no valid coordinate to anchor to past the last Match in
+  the first place). Functionally equivalent for the stated goal ("make it
+  clear these come after the last aligned event"); noted since the PI said
+  the exact implementation doesn't matter as long as it's correct.
+
+**4.8.2 How many events are actually "rescued," and which window is trustworthy.**
+`Eylul_gem_data/scripts/analyze_rescue_window.py` (SLURM:
+`slurm_full_run_allafterm/run_rescue_window_analysis.slurm`; output in
+`figures_window_analysis/`) answers three practical questions that came up
+when deciding what to plot next:
+- **Total/per-read `ALLAFTERM` length** (post-dedup, longest-`ALLAFTERM`-wins,
+  matching §4.7's rule): gem 50 reads / 212,484 events total (min 1,134,
+  median 3,328, mean 4,250, max 11,499); control 321 reads / 2,233,201 events
+  total (min 1,042, median 3,853, mean 6,957, max **725,085**). Note this
+  2,233,201 is *post-dedup* — §4.7's 2,476,953 figure is the pre-dedup,
+  all-347-blocks total; the two aren't the same denominator.
+- **One read dominates control's tail**: the single 725,085-event control
+  read alone accounts for 32.5% of *all* of control's pooled `ALLAFTERM`
+  events combined — 8.7× longer than control's next-longest read (83,223).
+  Gem has nothing comparable (max 11,499). This is why control's *mean*
+  tail length (6,957) looks so different from its *median* (3,853) while
+  gem's mean/median are close (4,250 / 3,328) — the difference in "events
+  rescued" between conditions is mostly this one outlier plus control simply
+  having 6.4× more qualifying reads, not a shifted population of ordinary
+  reads.
+- **Coverage decay** (event-offset at which each sample's unique-read count
+  first drops below X% of its own starting N): both samples hold effectively
+  100% coverage only out to ~1,000-1,100 events (gem: 100% to offset 1,135,
+  50% by offset 3,347; control: 100% to offset 1,043, 50% by offset 3,854).
+  Past a few thousand events the pooled median at large offsets is
+  increasingly just whichever 1-2 reads happen to still be that long — by
+  offset 80,000+ in control that's literally the one 725,085-event read.
+- **Read-level Mann-Whitney U by window** (median/mean per read, gem vs.
+  control, no pooled-event fallacy): window 100 → p≈0.06 (median) / 0.012
+  (mean); window **500 → p≈0.0037 (median) / 0.0036 (mean), the strongest
+  result, AUC≈0.63**; window 1,000 onward → null (p 0.25-0.91); full
+  untruncated comparison → null (p≈0.29) whether or not the two largest
+  control outlier reads are excluded (excluding them doesn't materially
+  change the null result, so the far tail's non-signal isn't an outlier
+  artifact — it's genuinely not there).
+- **Geometric argument for which window is biologically sensible**: the
+  center of the last aligned 9-mer (k=9) is reference position 611, so that
+  9-mer spans bases 607-615 — meaning gemcitabine, at base 614, is **already
+  inside the sensing footprint of the very last successfully-aligned event**,
+  not somewhere downstream of it. It should fully clear the pore's 9-mer
+  window only once the window's leading edge reaches ~base 618 (614+4), i.e.
+  ~7 bases past the anchor — at the PI's own ~5-events/base estimate, ~35
+  events, generously doubled or tripled for lesion-induced dwell-time slowing
+  still well under 100-150 events. **Conclusion: the first ~100-500 events
+  make much more sense than 1,000+ as the biologically relevant window** —
+  the ~1,000-event full-coverage boundary is about statistical power (every
+  read still contributes), not about where gemcitabine's signal should
+  actually be.
+
+**4.8.3 Dynamic time warping (DTW) of the first-N post-Match events.**
+Motivation (the PI's "elephant in the room"): post-Match events have no
+reference coordinate, and reads translocate at different speeds, so "event
+offset 7 after the last Match" in two different reads need not be the same
+physical base — naive fixed-offset averaging (§4.7 Part A/F) can blur or
+manufacture signal. DTW finds a monotonic correspondence between two
+signals' *shapes* rather than assuming a fixed events/base rate. DTW is
+inherently **pairwise** — there is no native N-way DTW — so aligning many
+reads onto one shared, comparable axis requires designating something fixed
+as the common target every read is aligned to.
+
+*First attempt and the bug it had.* Picked one real read (from the pooled
+gem+control set, closest by L1 distance to the pooled per-offset median) as
+that target, and ran plain unconstrained DTW (no limit on how far the
+warping path may stray from the diagonal). Caught via a control test before
+trusting the result: DTW-aligning **temporally shuffled** (pure noise, same
+values, scrambled order) copies of real reads to the same reference achieved
+**equal-or-higher** post-DTW correlation-to-reference than the genuinely-
+ordered reads (e.g. one read: 0.55 real vs. 0.71 shuffled). Unconstrained DTW
+was warping *anything* to resemble the reference; the resulting near-perfect
+gem/control overlap was an artifact, not a finding.
+
+*Fix* (`Eylul_gem_data/scripts/dtw_first100_align.py`, generalized past its
+filename to take `--window` — validated at both 100 and 500):
+- **Sakoe-Chiba band** (`--band-radius`, default 20 events): the warping path
+  cannot map a read-event more than this many positions from the diagonal.
+- **Step penalty** (`--step-penalty`): a fixed cost on non-diagonal (many-to-
+  one) moves, exactly like a gap penalty in sequence alignment. Banding
+  *alone* was not enough — swept radii 3-50 and even the best (20) only
+  barely passed the validation below (margin +0.15, right at threshold),
+  because a band still leaves the path free to hunt locally for whatever
+  nearby value happens to match noise by chance.
+- **DTW-barycenter reference** instead of one arbitrary read: start from the
+  pooled per-offset median, then iterate {banded-DTW-align every read to the
+  current reference → resample → median-of-resampled = next reference}
+  (`--barycenter-iters`, default 3) — a consensus is far harder to chase with
+  spurious warping than one specific read's own noise.
+- **The same real-vs-shuffled-noise control is now built into the script
+  itself** (`shuffle_control_validation`), run automatically every time and
+  printed as an explicit PASS/FAIL, annotated directly onto the figure's
+  title (not just the log) so the verdict travels with the plot.
+- **Validated parameters**: `band_radius=20, step_penalty=0.3,
+  barycenter_iters=3` → real reads reach mean post-DTW correlation-to-
+  reference 0.79 (window 100) / 0.77 (window 500) vs. 0.58 for shuffled
+  noise in both — margins +0.21 / +0.19, comfortably passing.
+- Cost is `O(window × band_radius)` per read pair; the script refuses
+  `--window` above 300 without an explicit `--force-large-window`
+  acknowledging the cost tradeoff (this is why the pool is only ever used at
+  small windows — the full uncapped `ALLAFTERM` range, up to 725,085 events
+  for one control read, is computationally infeasible for DTW regardless of
+  banding).
+
+*Visual result*: once genuinely pathological warping is ruled out, gem and
+control's DTW-aligned median curves largely **track each other** through the
+whole window (sharp shared peaks recur at the same warped positions in both
+samples, extending across the full 500-event window tested, not just the
+first 100). This is expected, not a null result — both samples read the same
+reference locus, so the ordinary (non-lesion) sequence context downstream of
+the anchor should produce near-identical expected signal; DTW recovers that
+shared, sequence-driven shape that fixed-offset averaging had smeared into
+noise. The original (buggy, unconstrained) run is kept at
+`figures_dtw_first100/` purely as a record of the bug — **do not use it**;
+the validated outputs are in `figures_dtw_first100_banded/` and
+`figures_dtw_first500_banded/` (`dtw_vs_naive_first{100,500}_{mean,median}.png`
+— both a `mean ± 1 SD` and a `median ± IQR` variant were built, since the two
+turned out visually near-identical, i.e. this signal is not a few-outlier-
+reads artifact; `dtw_warped_matrix.tsv`, `dtw_barycenter_reference.tsv`,
+`dtw_cost_per_read.tsv`, `dtw_vs_naive_band_summary.tsv`, a cached extraction
+TSV to avoid re-parsing the full `.align` files on every re-run).
+
+**4.8.4 Read-level statistics on the DTW-aligned data**
+(`Eylul_gem_data/scripts/dtw_read_level_stats.py`, output
+`figures_dtw_first100_banded/dtw_read_level_stats.tsv`). Mann-Whitney U,
+gem vs. control, on **per-read** median/mean over pre-registered windows
+(10, 20, 35, 50, 100 events — chosen from the §4.8.2 geometric estimate),
+comparing the DTW-aligned values against the naive (unwarped) values at the
+identical offsets, 20 tests total, Bonferroni threshold 0.0025:
+- **Only one result survives correction: DTW-aligned per-read median over
+  the first 20 events, p=0.00053, AUC=0.65.** At that same window the naive
+  (unwarped) version shows nothing (p=0.52) — a real instance of DTW
+  correction recovering a signal that fixed-offset averaging missed.
+- At window 0-35 (the geometric "full lesion clearance" estimate) the
+  pattern **inverts**: DTW shows nothing (p≈0.9-0.99) while naive shows a
+  weak, uncorrected-only signal (p≈0.03, does not survive Bonferroni) that
+  disappears under DTW. The two methods disagree at both windows, in
+  opposite directions — a sign that any real effect is narrow and fragile
+  (roughly events 9-20 after the anchor), not a broad signature across the
+  whole predicted footprint.
+- Window 0-100 naive-mean result (p=0.012) exactly reproduces §4.8.2's
+  independently-computed window-100 result — a useful cross-check that the
+  two scripts' per-read aggregation logic agree.
+- A separate, explicitly-flagged **exploratory/circular** check on the exact
+  offsets {9, 13, 14, 18} (chosen *because* they showed the largest
+  gem-control gap in this same dataset) reaches even lower p-values
+  (down to 0.001) — reported for the record only; selection bias makes this
+  non-confirmatory, and the pre-registered 0-20 window above isn't fully
+  independent of that same earlier observation either, so treat 0.00053 as
+  a strong lead rather than a clean confirmation.
+
+**4.8.5 A ground-truth before/after comparison**
+(`Eylul_gem_data/scripts/before_after_match_plot.py`; SLURM:
+`run_before_after_{100,500}_kutem_gpu.slurm`; output in
+`figures_before_after_{100,500}/`). Motivated by a natural question: does
+gem vs. control track as closely on the *known-aligned* side of the anchor
+as DTW claims to recover on the unaligned side? Built without any new C++
+output or a persistent raw-index tracker — **the needed data was already
+being printed**: the ordinary per-position Match lines emitted throughout
+every window of the read (`event_coord\tkmerRef\tscaledEvent\tkmerStrand\t
+meanStd.first`, one line per **raw ADC sample**, several consecutive lines
+sharing one `event_coord`). Grouping consecutive same-`event_coord` lines
+and averaging their `scaledEvent` recovers the true per-event mean at
+identical scaling to `ALLAFTERM` (scaling is affine, so it commutes with
+averaging); insertion lines are already distinguishable (an all-`N`
+`kmerStrand`) and excluded, since they don't correspond to a confirmed
+reference base. Safe without tracking any extra index because
+`event_coord` only ever moves in one direction through a whole read
+(alignment.cpp's outer loop never revisits an earlier `reference_index`) —
+consecutive lines sharing a coordinate are guaranteed to be one physical
+event, never two coincidentally-revisited ones. Unlike the post-Match side,
+**this pre-anchor side needs no DTW at all** — it's genuinely reference-
+locked across reads already, by construction of the HMM alignment.
+
+Constraint discovered while building this: the reference amplicon is only
+~600-610bp total (the last-Match anchor sits at ~base 611), so requesting
+500 pre-anchor events uses nearly the *entire* aligned region — only 28/50
+gem reads and 235/321 control reads have that many distinct aligned
+positions (window 100 has full coverage: 50/50 gem, 321/321 control).
+
+Result, both window sizes: gem and control track each other **tightly**
+before the anchor (real, position-locked ground truth — a positive control
+confirming the shared-signal phenomenon isn't a scaling artifact). That
+tight co-variation **collapses immediately** in the naive (unwarped)
+after-panel, but is **substantially recovered** in the banded-DTW after-
+panel — visually a far smoother transition across the anchor than the naive
+version's sharp break. The one place gem and control still visibly separate
+in the DTW panel is the same narrow bump around offset +10 to +20 already
+flagged statistically in §4.8.4 — consistent, but (per that section's own
+caveat) not to be read as a significance test by eye.
+
+**Scientific bottom line for §4.8**: there is a real, narrow, DTW-dependent
+signal around events 9-20 after the last Match (read-level MWU p=0.00053,
+survives Bonferroni across the pre-registered window sweep) that naive
+fixed-offset analysis misses, geometrically consistent with where
+gemcitabine (base 614) should actually manifest, and visually consistent
+across the coverage-decay analysis, the DTW band plots, and the
+before/after ground-truth comparison. It is not confirmed at the wider
+window the geometry also seemed to predict (0-35), the window-20 boundary
+isn't fully independent of an earlier data-driven observation, and — as in
+§4.7 — a real, reproducible difference here still needs to be distinguished
+from a systematic gem-vs-control library-prep effect before attributing it
+to gemcitabine specifically. Treat as the most promising lead so far, worth
+independent validation (e.g. a held-out split, or a different barycenter
+reference) before presenting it as a finding.
+
 ---
 
 ## 5. Current state and where to look for what
@@ -942,7 +1183,11 @@ read off IQR-band overlap.
 | What is `--tail-source`/`TAIL_SOURCE1`/`TAIL_SOURCE2`, and why a third `NEXT100EVT` pool exists (the PI's proposed `eventIndeces`/`lastMatchRawIdx` anchor) | §4.4-4.6 above; `TAIL_SIGNAL_CAPTURE.md` §§8-9 |
 | How to plot/re-plot the tail-capture results | Cutoff-anchored: `TAIL_SIGNAL_CAPTURE.md` §6, `Eylul_gem_data/scripts/plot_tail_signal.py`. End-anchored, read-deduplicated (the more biologically relevant view, since Gem is expected right at the physical 3' end): `TAIL_SIGNAL_CAPTURE.md` §7, `Eylul_gem_data/scripts/plot_tail_signal_end_focused.py`. Event-count-anchored, uncapped (`ALLAFTERM`/`NEXT100EVT`), with read-level statistics: `TAIL_SIGNAL_CAPTURE.md` §10, `Eylul_gem_data/scripts/plot_allafterm_analysis.py` |
 | What is `ALLAFTERM`, how does it relate to `NEXT100EVT`, and is the post-Match signal actually different gem vs control at the read level | §4.7 above; `TAIL_SIGNAL_CAPTURE.md` §10 |
-| Recommended next analytical steps | `TAIL_SIGNAL_CAPTURE.md` §5 (changepoint analysis on the tail, investigating the ~98% 3' soft-clip rate, revisiting the qualifying-rate asymmetry noted independently in both §2.2 above and there) |
+| How many events are actually "rescued," which window is trustworthy, why does the first-100-event difference disappear over the full range, and where should gemcitabine's signal actually show up geometrically | §4.8.2 above; `Eylul_gem_data/scripts/analyze_rescue_window.py`; `figures_window_analysis/` |
+| What is dynamic time warping being used for here, why did the first attempt need to be thrown out, and what are the validated parameters | §4.8.3 above; `Eylul_gem_data/scripts/dtw_first100_align.py`; `figures_dtw_first{100,500}_banded/` (NOT `figures_dtw_first100/`, which is the invalidated first attempt) |
+| Is there an actual statistically-defensible gem-vs-control difference anywhere in the post-Match region, and how strong is it | §4.8.4 above; `Eylul_gem_data/scripts/dtw_read_level_stats.py`; `figures_dtw_first100_banded/dtw_read_level_stats.tsv` |
+| Does gem vs control track as closely on the known-aligned (pre-anchor) side as DTW claims to recover on the post-Match side | §4.8.5 above; `Eylul_gem_data/scripts/before_after_match_plot.py`; `figures_before_after_{100,500}/` |
+| Recommended next analytical steps | `TAIL_SIGNAL_CAPTURE.md` §5 (changepoint analysis on the tail, investigating the ~98% 3' soft-clip rate, revisiting the qualifying-rate asymmetry noted independently in both §2.2 above and there); §4.8's own bottom line calls for independent validation (held-out split or a different barycenter reference) of the events-9-20 signal before treating it as more than a lead |
 
 **Headline status as of the full SLURM runs**: 50/3488 gem reads (~1.4%) and
 321/4778 control reads (~6.7%, unique-read count — the raw qualifying-*block*
@@ -977,3 +1222,31 @@ from a systematic gem-vs-control library-prep effect (the same open question
 already flagged for the qualifying-rate asymmetry) before attributing it to
 gemcitabine specifically. Treat as a hypothesis worth a proper follow-up, not
 a conclusion.
+
+**Update (2026-07-16, time-warped analysis and ground-truth comparison,
+§4.8)**: the 2026-07-15 read-level signal above was measured with naive,
+fixed-offset averaging over the first 100 events — that same window turns
+out to be one where naive and DTW-corrected analysis actively disagree
+(§4.8.4), so it should now be read in light of the following, more targeted
+result rather than standing alone. Caught and fixed a real bug first: an
+initial unconstrained-DTW attempt was pathological (shuffled noise matched
+the reference as well as real reads did) and was rebuilt with a banded,
+regularized, barycenter-referenced version whose validation is now
+automatic and printed with every run. With that fixed implementation, a
+read-level Mann-Whitney U on the DTW-aligned per-read median over the first
+20 post-Match events is the only result (of 20 pre-registered tests, gem vs
+control, several window sizes) that survives Bonferroni correction
+(p=0.00053, AUC=0.65) — and it lines up with three independent lines of
+evidence: the geometric prediction that gemcitabine (base 614) sits just
+inside the last aligned 9-mer's own sensing window rather than far
+downstream; the read-level windowed-MWU sweep in §4.8.2, which peaks at
+window 500 and goes null by window 1,000; and a new ground-truth
+before/after comparison (§4.8.5) showing gem and control track tightly on
+the known-aligned side of the anchor, lose that tracking under naive
+post-Match averaging, and substantially recover it once DTW-aligned — with
+the one visible remaining divergence sitting at the same events-9-20
+location. None of this is yet an independently-validated finding (the
+window-20 choice isn't fully free of having already seen where the
+divergence clustered), and the same library-prep-confound caveat above
+still applies — but it is the most specific, best-corroborated lead this
+project has produced on the post-Match region so far.

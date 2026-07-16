@@ -39,5 +39,11 @@ src/softwarepath.h
 *.sif
 
 gem_data/
-Eylul_gem_data/
+Eylul_gem_data/gem/
+Eylul_gem_data/control/
 
+#large generated data/cache, wherever it appears under Eylul_gem_data/ -
+#code (scripts, .slurm job files) should still be tracked
+*.align
+*.align.log
+__pycache__/

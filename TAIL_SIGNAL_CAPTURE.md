@@ -818,3 +818,306 @@ qualifying reads got exactly 100 `NEXT100EVT` samples (5,000 and 34,700 total
 respectively) — no read ran out of events before reaching the 100-event cap,
 consistent with Source 2 alone never dropping below ~5,000 raw samples per
 read in either dataset.
+
+## 10. `ALLAFTERM`: the uncapped pool, plus a full read-level analysis (added 2026-07-15)
+
+### What changed and why
+
+`NEXT100EVT` (§9) is a fixed, 100-event window — useful for a uniform,
+comparable-across-reads view, but it discards everything past event 100, and
+every qualifying read in this dataset turned out to have well over 100 events
+available (`NEXT100EVT` never got truncated by running out of data — see §9).
+`ALLAFTERM` removes the cap: it is **every valid event in `r.events` from
+`lastMatchRawIdx + 1` to `r.events.size()`**, i.e. `NEXT100EVT`'s full,
+uncapped superset. `NEXT100EVT` itself is **unchanged** — same anchor, same
+collection code, same output lines as before.
+
+`src/alignment.cpp` changes:
+- **Collection** (lines 996–1016), immediately after `NEXT100EVT`'s own
+  collection block, reusing the identical `lastMatchRawIdx`/`haveLastMatchRawIdx`
+  computed once per read (§9) — no new anchor logic:
+  ```cpp
+  std::vector<double> tailSignalAllAfterM;
+  if ( (wantSource1 or wantSource2) and haveLastMatchRawIdx and lastMatchRawIdx < r.events.size() ){
+      for ( size_t evi = lastMatchRawIdx + 1; evi < r.events.size(); evi++ ){
+          double event_mean = r.events[evi].mean;
+          if ( not (0. < event_mean and event_mean < 250.) ) continue;
+          double scaledEvent = (event_mean - r.scalings.shift) / r.scalings.scale;
+          tailSignalAllAfterM.push_back(scaledEvent);
+      }
+  }
+  ```
+  The extra `lastMatchRawIdx < r.events.size()` guard (beyond the existing
+  `haveLastMatchRawIdx`) is defensive: it makes the invariant "never compute
+  `lastMatchRawIdx + 1` from an out-of-range value, never index an empty
+  `r.events`" explicit, rather than relying on the for-loop's own bound
+  (`evi < r.events.size()`) to make an already-out-of-range start a silent
+  zero-iteration no-op. Gated on the exact same `(wantSource1 or wantSource2)`
+  condition as `NEXT100EVT` — no new CLI flag, still off by default under
+  `--tail-source none`.
+- **Output** (lines 1043–1051), printed immediately after `NEXT100EVT` for the
+  same read: `ALLAFTERM\t<idx>\t<val>` lines. Deliberately does **not** start
+  with `TAIL`, for the identical reason `NEXT100EVT` doesn't (§9) — existing
+  scripts keying off a bare `"TAIL"` prefix would otherwise silently fold this
+  pool in as more "legacy" signal.
+- **Terminal summary**: `countTailLines` (line 199) gained a fourth counter
+  `n4`; `printTailCaptureSummary` (lines 250–277) gained block-level count,
+  **unique-read-ID count** (`std::set<std::string> uniqueReadIDsWithAllAfterM`,
+  line 1115, accumulated inside the same `#pragma omp critical` section as
+  every other counter — thread safety unchanged), total event count, and
+  min/median/mean/max events-per-alignment-block.
+- **Unchanged, verified**: ordinary reference-anchored output, Source 1/2
+  collection, `NEXT100EVT` itself, `r.QCpassed` / read QC, the forward/full-
+  reference/no-3′-soft-clip gate (§8), and `src/detect.cpp`/`src/trainCNN.cpp`
+  (both still pass `TailCaptureMode::NONE` literally, so `wantSource1`/
+  `wantSource2` are always false there and this new code never executes for
+  either tool) — see validation below for how this was actually checked, not
+  just asserted.
+
+### Output semantics — read this before using the data
+
+- **`NEXT100EVT` is exactly the first up-to-100 valid entries of `ALLAFTERM`**,
+  unless the read has fewer than 100 remaining valid events (in this dataset,
+  none did — every qualifying read had ≥100). Verified exactly, per read
+  block, not just claimed — see validation §1 below.
+- **`ALLAFTERM` can and typically does span both Source 1 and Source 2
+  territory.** It is defined purely by position relative to `lastMatchRawIdx`,
+  with no reference to which mechanism (terminal-window trailing insertion vs.
+  rough-aligner trim) produced a given event — unlike Source 1/Source 2, which
+  are split by mechanism.
+- **Granularity differs by pool.** Source 1/Source 2 are printed at *expanded
+  raw-ADC-sample* granularity (several lines per detected event, from each
+  event's `.raw[]`). `NEXT100EVT` and `ALLAFTERM` are printed at *event-mean*
+  granularity (one line per detected event, its `.mean`, never expanded). A
+  "length" in one space is not a length in the other; never compare them
+  directly.
+- **Neither `NEXT100EVT` nor `ALLAFTERM` proves biological origin.** This is
+  recovered signal past the last position the reference-anchored HMM modelled
+  — it may include pore adapter signal, motor-protein signal, ordinary dwell
+  variability, or (for reads that pass the 3′ gate, which already excludes
+  soft-clipped/ligation-artifact reads) genuine non-reference sequence. A
+  plot showing recovered signal is not itself evidence that recovered signal
+  corresponds to the gemcitabine position specifically.
+- **Events already labelled Match remain excluded from both pools** and stay
+  exactly where they always were: ordinary, reference-anchored `.align`
+  output, untouched by any of this.
+
+### Validation
+
+Ran `Eylul_gem_data/scripts/validate_allafterm.py` (new script, checks 1/3/4/5
+below) plus two one-off checks (2/6/7) not built into that script:
+
+1. **`NEXT100EVT` == first up-to-100 valid `ALLAFTERM` entries, every block.**
+   PASS on the smoke test (9 gem / 59 control blocks with data) and the full
+   canonical run (50 gem / 347 control blocks with data) — zero mismatches in
+   either case.
+2. **Existing normal/Source 1/Source 2 output byte-identical to pre-change
+   output, modulo new `ALLAFTERM` lines.** A naive whole-file `diff` on the
+   full-dataset output was NOT usable for this — it never finished, because
+   **the order read blocks are written in is not deterministic across
+   separate runs** (an existing property of `align_main`'s OpenMP-parallel
+   loop: whichever thread's `#pragma omp critical` section runs first writes
+   first, and thread scheduling isn't guaranteed identical run-to-run — this
+   is pre-existing, unrelated to `ALLAFTERM`, and was confirmed directly:
+   both runs' files contain the exact same *set* of read headers, just in a
+   different *order*). Verified instead with a small order-independent
+   script (per-read-ID, sorted multiset of SHA-256 block hashes, ALLAFTERM
+   lines stripped from the new file before hashing — handles the
+   documented duplicate-block-per-read-ID case too, since a read_id's several
+   blocks are compared as a set, not by position): **zero content mismatches**
+   across all 3,002 gem / 3,764 control unique read_ids common to both the
+   pre-`ALLAFTERM` canonical files (`slurm_full_run/{gem,control}/*.full.align`)
+   and the new ones (`slurm_full_run_allafterm/{gem,control}/*.full.align`).
+3. **`ALLAFTERM` indices start at 0 and are contiguous per block.** PASS,
+   both smoke test and full run.
+4. **No `ALLAFTERM` for gate-failing reads.** Structurally guaranteed by
+   `effectiveTailMode = readPassesTailGate ? args.tailSourceMode :
+   TailCaptureMode::NONE` (§8, unchanged) — a gate-failing read gets `NONE`,
+   which makes `wantSource1`/`wantSource2` both false, which is `ALLAFTERM`'s
+   own collection gate. Checked as a proxy (every block with `ALLAFTERM` also
+   has `NEXT100EVT` and vice versa, since they share one gate) rather than
+   re-deriving the gate itself: PASS, zero orphan cases in either dataset.
+5. **Empty/short remainders don't crash.** 3,343/3,393 gem blocks and
+   4,234/4,581 control blocks in the full canonical files have *zero*
+   tail-prefixed lines at all (reads that never reached `eventalign` with a
+   passing gate, or extremely short remainders) — `validate_allafterm.py`
+   parsed all of them without exception.
+6. **Duplicate read IDs reported and handled deterministically by the
+   plotting script.** `plot_allafterm_analysis.py`'s dedup rule (keep the
+   block with the longer `ALLAFTERM` array) is applied and reported — see
+   its run log below for exact block/unique-read/collision counts.
+7. **Plotted sample sizes refer to unique read IDs, not alignment blocks.**
+   Every legend/title in the new script reports `n` from the deduplicated
+   per-read dictionaries, and the terminal-summary unique-read-ID count
+   (independently computed in C++, via `uniqueReadIDsWithAllAfterM`) matches
+   the Python-side dedup count exactly (321 control unique reads, both sides)
+   — an incidental but reassuring cross-check that both independently-written
+   dedup mechanisms agree.
+
+### Commands used
+
+```bash
+# Build (cosbi partition, see Eylul_gem_data/scripts/... smoke test scripts for the pattern)
+make -j8 LDFLAGS="-L$HOME/lib -ldl -llzma -lbz2 -lm -lz"
+
+# Smoke test (500-read cap, both datasets)
+Eylul_gem_data/scripts/run_next100evt_smoketest.slurm-style invocation, -l 600 -m 500 --tail-source both
+
+# Full canonical run -- NEW directory, existing slurm_full_run/ untouched
+Eylul_gem_data/slurm_full_run_allafterm/run_tailcapture_allafterm.slurm
+  sbatch --export=ALL,DATASET=gem     run_tailcapture_allafterm.slurm   # job 1359705
+  sbatch --export=ALL,DATASET=control run_tailcapture_allafterm.slurm   # job 1359706
+
+# Validation
+python3 Eylul_gem_data/scripts/validate_allafterm.py --align <file>
+
+# Plotting
+Eylul_gem_data/slurm_full_run_allafterm/run_allafterm_plots.slurm       # job 1359779
+```
+
+### Counts (full canonical run, `-l 600 --tail-source both`, identical filter to §8-9)
+
+| | gem | control |
+|---|---|---|
+| reads passing tail gate | 50 | 347 (321 unique) |
+| Source 1 reads (samples) | 0 (0) | 6 (1,062) |
+| Source 2 reads (samples) | 50 (1,094,466) | 347 (12,585,799) |
+| NEXT100EVT reads (samples) | 50 (5,000) | 347 (34,700) |
+| ALLAFTERM blocks (unique reads) | 50 (50) | 347 (321) |
+| ALLAFTERM total events | 212,484 | 2,476,953 |
+| ALLAFTERM events/block: min/median/mean/max | 1,134 / 3,346 / 4,249.7 / 11,499 | 1,042 / 3,950 / 7,138.2 / 725,085 |
+
+Every pre-existing number (reads passing gate, Source 1/2, NEXT100EVT) is an
+**exact match** to §8-9's figures, confirming the ALLAFTERM addition changed
+nothing about existing behavior.
+
+### Figures and TSVs
+
+See `PROJECT_OVERVIEW.md` §4.7 for the full walkthrough of what each figure
+shows and the scientific-limitations discussion; paths below, all under
+`Eylul_gem_data/slurm_full_run_allafterm/figures_allafterm/`:
+
+- Part A (HMM-Match-anchored): `allafterm_hmm_anchored_first100.{png,tsv}`,
+  `allafterm_hmm_anchored_first500.{png,tsv}`
+- Part B (physical-end-anchored): `allafterm_physical_end_last{100,500,3000}.{png,tsv}`
+- Part C (read-level): `allafterm_read_level_summary.tsv`,
+  `allafterm_read_level_boxplots_{25,50,100}.png`,
+  `allafterm_first100_median_boxplot.png`
+- Part D (remaining-length distribution): `allafterm_remaining_length_hist.png`,
+  `allafterm_remaining_length_hist_log.png`, `allafterm_remaining_length_ecdf.png`,
+  `allafterm_remaining_length_boxplot.png`, `allafterm_remaining_length.tsv`
+- Part E (individual traces): `allafterm_examples_gem.png`,
+  `allafterm_examples_control.png`
+- **Part F (added 2026-07-15, full/untruncated), see below**:
+  `allafterm_full_read_mean_median_boxplots.png` + `allafterm_full_read_mean_median.tsv`,
+  `allafterm_hmm_anchored_full_trace.png` + `_logx.png` + `.tsv`
+
+Disposable smoke-test output: `Eylul_gem_data/smoketest_allafterm/` — not
+wired into any other script's default paths, same convention as §8-9's
+smoke-test directories.
+
+### Part F: full, untruncated ALLAFTERM (added 2026-07-15)
+
+Every earlier figure (Parts A-E) caps at 100/500/3000 events for readability
+and comparability across reads. Part F removes every cap: **every event in
+every deduplicated read's `ALLAFTERM` array is used, in full** — not
+`NEXT100EVT`, not Source 1/2 raw samples, not any physical-end-truncated
+subset. Confirmed directly from the run: `plot_full_read_boxplots` and
+`plot_full_hmm_anchored_trace` both read from the `gem_allafterm`/
+`control_allafterm` dicts (the same ones Parts A-D already use, populated
+solely from `ALLAFTERM` lines via `load_blocks`), and both are called with no
+`window`/`max_len` argument — the mean/median in
+`allafterm_full_read_mean_median.tsv` are computed over `arr` directly (no
+slicing at all), and `allafterm_hmm_anchored_full_trace`'s matrix width is
+`max(len(a) for a in gem_arrays + control_arrays)` — i.e. exactly as long as
+the single longest read in either sample (725,085 events, a control read).
+
+**Counts**: 50 gem / 321 control unique reads in both new outputs (identical
+to every other Part in this analysis — same dedup, same `main` dicts).
+
+**`allafterm_full_read_mean_median_boxplots.png`**: two panels (per-read mean,
+per-read median), one point per unique read regardless of tail length — a
+read with 725,085 events and a read with 1,042 each contribute exactly one
+number to each panel. `allafterm_full_read_mean_median.tsv` (371 rows:
+read_id, sample, n_allafterm_events, mean, median) has the underlying values.
+
+**`allafterm_hmm_anchored_full_trace.png`** (+ `_logx.png`): gem vs control
+median±IQR from x=1 (first event after the final HMM Match) through
+whichever read goes furthest in either sample, with a coverage (n
+contributing unique reads) subpanel and vertical markers (dotted/dashed/
+dashdot/finely-dotted, colored per sample) at each sample's own 50%/25%/10%/5%-
+of-starting-count crossing — printed in the run log too (gem crosses 50% at
+event 3,347, 25% at 5,973, 10% at 8,527, 5% at 9,086, out of 50 starting
+reads/11,499-event longest read; control crosses 50% at 3,854, 25% at 5,519,
+10% at 8,105, 5% at 10,433, out of 321 starting reads/725,085-event longest
+read). The linear-x version is dominated by the ~14,500:1 span between the
+shortest and longest contributing reads (gem's entire curve is compressed
+into the leftmost sliver) — exactly the "unreadable" case anticipated, so the
+log-x version is the one to actually read; both retain the complete x=1..725,085
+range (log-x is a different x-axis *scale*, not a truncation — every position
+is still plotted in both).
+
+**One real rendering limitation hit and fixed**: `fig.savefig` initially
+crashed with `OverflowError: In draw_markers: Exceeded cell block limit` —
+matplotlib's Agg backend on this environment cannot draw a line/filled-polygon
+with control's full ~725,085 vertices. This is a *display* limitation, not a
+data problem — `allafterm_hmm_anchored_full_trace.tsv` (736,584 rows) already
+has full, one-row-per-event resolution and was written successfully before
+the crash. Fixed with `decimate_for_plot()`: stride-based decimation *for
+rendering only*, capped at 20,000 points per line, always keeping the exact
+first and last point so the plotted range's endpoints are exact — the TSV is
+never decimated. This does not affect any other Part's plots (their
+100/500/3000-point windows were always well under this limit).
+
+**Companion TSV columns** (`allafterm_hmm_anchored_full_trace.tsv`): `sample`,
+`event_offset_after_last_M` (1-based), `n_unique_reads`, `median`, `mean`,
+`q1`, `q3` — one row per (sample, offset) pair where at least one read
+contributes, i.e. up to that sample's own longest read (not padded with
+placeholder rows beyond it).
+
+### Scientific findings: is the post-Match signal actually different, gem vs control?
+
+Pooled-event median±IQR bands (Parts A/B, all zoom levels) show substantial
+overlap throughout, consistent with every earlier analysis in this project —
+**but IQR-band overlap/non-overlap is not a significance test**, so a direct
+read-level check was run instead: for each unique read, compute the summary
+statistic (median/mean/std/slope-vs-event-number/fraction above +1/fraction
+below −1) over its own first 25, 50, and 100 post-Match events, then compare
+gem's 50 values against control's 321 values per metric with a two-sided
+Mann-Whitney U test (nonparametric, doesn't assume normal per-read summary
+statistics; one test per read, not per pooled event — the read is the unit).
+
+At the 100-event window: read-level **mean** (p≈0.012), **slope vs. event
+number** (p≈0.0015), and **fraction of events below −1** (p≈0.0046) all show a
+nominally significant difference, with control trending more negative than
+gem as the window widens (25→50→100 events); the **median** itself is only
+borderline (p≈0.062, common-language/AUC≈0.58 — a randomly picked gem read
+exceeds a randomly picked control read about 58% of the time, a modest, not
+large, effect). **Robustness check**: dropping the 3 most extreme reads (by
+|median|) from each group at the 100-event window *tightens* the median's
+p-value (0.062 → 0.0087) rather than weakening it — the apparent difference is
+not being carried by a handful of outlier reads; if anything, a few atypical
+reads in each group were adding noise that partially masked it.
+
+**Caveats that must accompany this, not follow it as an afterthought:**
+- ~15 metric/window combinations were tested with no multiple-comparison
+  correction — at nominal p<0.05 alone, a false positive or two among 15
+  correlated tests is expected by chance. The *consistency of direction*
+  across window sizes and correlated metrics (mean, slope, and
+  fraction-below-−1 all pointing the same way) is reassuring but not a
+  substitute for a pre-registered or corrected test.
+- Sample sizes remain modest and asymmetric (50 gem vs. 321 control).
+- This region is entirely **past** the reference-anchored, HMM-modelled part
+  of the read (§4.4/§4.7's "does not prove biological origin" caveat applies
+  in full) — a genuine, reproducible gem-vs-control difference *here* still
+  cannot, by this analysis alone, be attributed to gemcitabine specifically
+  rather than to some other systematic difference between the two library
+  preps (the same open question already flagged for the qualifying-rate
+  asymmetry, `TAIL_SIGNAL_CAPTURE.md` §4/§8).
+
+**Conclusion**: there is a modest, read-level, outlier-robust signal — not
+just a pooled-event or band-overlap artifact — but it is not large, not
+correction-adjusted, and not yet distinguishable from a prep-batch effect.
+Treat as a specific, well-defined hypothesis for follow-up (e.g. a
+pre-registered test on independent/held-out reads, or matched-prep controls),
+not as evidence of gemcitabine detection.

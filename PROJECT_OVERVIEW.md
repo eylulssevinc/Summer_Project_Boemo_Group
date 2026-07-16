@@ -779,17 +779,155 @@ into that bucket, double-counting samples already present in Source 1/2.
 **Verified on the full canonical dataset** (`-l 600 --tail-source both`,
 `slurm_full_run/{gem,control}/*.full.align`): every one of the 50 gem and 347
 control qualifying reads got exactly 100 `NEXT100EVT` samples — no read ran
-out of events before the cap. Manually inspected both qualifying blocks of
-control read `e1cd3406-9f89-4862-9055-ca6e242e4e69` (the same duplicate-block
-readID noted in `TAIL_SIGNAL_CAPTURE.md` §8's dedup bugfix): its block *with*
-Source 1 signal (990 samples) shows `NEXT100EVT` picking up immediately after
-the last `TAIL_SOURCE1` line and continuing through `TAIL_SOURCE2`'s range with
-no gap — i.e. exactly the "folds Source 1 into the window" behaviour predicted
-above, distinguishing it from the block *without* Source 1 signal, where
-`NEXT100EVT` starts immediately after `TAIL_SOURCE2`'s last line instead. Full
+out of events before the cap.
+
+**Important note on how this was actually verified** (correcting an earlier,
+weaker check): printed line *position* in the `.align` file is always
+`TAIL_SOURCE1` → `TAIL_SOURCE2` → `NEXT100EVT` regardless of which raw events
+`NEXT100EVT` draws from (Source 1/2 print their full buffers unconditionally
+when requested; `NEXT100EVT` is a separately-collected pool printed after
+them) — so "does `NEXT100EVT` appear right after `TAIL_SOURCE1`/`TAIL_SOURCE2`
+in the file" does **not** actually prove *which* raw events it contains. The
+real proof is a direct comparison of `lastMatchRawIdx` (this anchor) against
+`r.eventAlignment.back().first` (Source 2's own boundary), which was done with
+a temporary debug print (see `TAIL_SIGNAL_CAPTURE.md` §9's table): for control
+read `e1cd3406-9f89-4862-9055-ca6e242e4e69`'s block with 0 Source 1 signal,
+both anchors were identical (50434); for its other block, with 990 Source 1
+*samples*, `lastMatchRawIdx` (51082) was 193 raw *events* earlier than Source
+2's boundary (51275) — confirming the anchor genuinely differs, by exactly the
+span of that block's Source 1 signal, exactly as this section predicts. Full
 details, exact sample counts, and the smoke-test history (including an earlier,
 since-corrected version of this feature that anchored at Source 2's boundary
 instead) are in `TAIL_SIGNAL_CAPTURE.md` §9.
+
+### 4.7 `ALLAFTERM`: the uncapped pool, and a full read-level analysis (added 2026-07-15)
+
+`NEXT100EVT` (§4.6) is fixed at 100 events — useful for a uniform,
+comparable-across-reads view, but every qualifying read in this dataset had
+well over 100 events available past `lastMatchRawIdx`, so 100 events discards
+most of the recoverable signal. `ALLAFTERM` is the same pool, uncapped:
+**every valid event in `r.events` from `lastMatchRawIdx + 1` to
+`r.events.size()`**, i.e. `NEXT100EVT`'s full superset, using the identical
+anchor, guard, and scaling. `NEXT100EVT` itself did **not** change.
+
+```cpp
+// src/alignment.cpp:996-1016, immediately after NEXT100EVT's own collection,
+// reusing the same lastMatchRawIdx/haveLastMatchRawIdx computed once per read:
+std::vector<double> tailSignalAllAfterM;
+if ( (wantSource1 or wantSource2) and haveLastMatchRawIdx and lastMatchRawIdx < r.events.size() ){
+    for ( size_t evi = lastMatchRawIdx + 1; evi < r.events.size(); evi++ ){
+        double event_mean = r.events[evi].mean;
+        if ( not (0. < event_mean and event_mean < 250.) ) continue;
+        double scaledEvent = (event_mean - r.scalings.shift) / r.scalings.scale;
+        tailSignalAllAfterM.push_back(scaledEvent);
+    }
+}
+```
+
+Printed as `ALLAFTERM\t<idx>\t<val>` lines (`src/alignment.cpp:1043-1051`,
+immediately after `NEXT100EVT` for the same read) — deliberately not
+`TAIL`-prefixed, same reasoning as `NEXT100EVT` (§4.6). Terminal summary
+(`printTailCaptureSummary`) gained block count, a genuinely **unique-read-ID**
+count (a `std::set<std::string>`, accumulated inside the same
+`#pragma omp critical` section as every other counter — thread safety
+unchanged), total event count, and min/median/mean/max events per alignment
+block. Gated on the identical `(wantSource1 or wantSource2)` condition as
+everything else in this feature — no new CLI surface, still off by default.
+
+**Output semantics — four distinctions that matter when interpreting the new
+plots (§4.7's plotting script, below):**
+1. **`NEXT100EVT` is exactly `ALLAFTERM`'s first up-to-100 valid entries** —
+   proven per-block (not just asserted) by `validate_allafterm.py`, PASS on
+   both the smoke test and the full canonical run, zero mismatches.
+2. **Granularity differs by pool.** Source 1/Source 2 print *expanded raw-ADC
+   samples* (several lines per event). `NEXT100EVT`/`ALLAFTERM` print one line
+   per *event mean*, never expanded. A length in one space is not a length in
+   the other.
+3. **`ALLAFTERM` can span both Source 1 and Source 2 territory** — it has no
+   concept of which mechanism produced a given event, unlike the §4.4 split.
+4. **Neither pool proves the recovered signal is the modelled construct's
+   final bases specifically** — it may be adapter, motor-protein, ordinary
+   dwell variability, or (for reads already past the 3′ soft-clip gate)
+   genuine non-reference sequence. Match-labelled events remain excluded from
+   both pools and untouched in ordinary output.
+
+**Validation** (full detail, exact numbers, and the one genuine surprise
+encountered — pre-existing OpenMP block-order nondeterminism unrelated to this
+change — are in `TAIL_SIGNAL_CAPTURE.md` §10): all 7 requested checks passed,
+including a byte-identical comparison of every pre-existing line against the
+pre-`ALLAFTERM` canonical files (order-independent, per-read-ID multiset
+hash comparison, since raw `diff` doesn't handle across-run block reordering).
+
+**New plotting script**: `Eylul_gem_data/scripts/plot_allafterm_analysis.py`
+(does not overwrite the two existing plotting scripts). Parses `NEXT100EVT`
+and `ALLAFTERM` independently; deduplicates by read_id keeping the block with
+the **longer `ALLAFTERM` array** (documented as deliberately simpler than
+§4.4's per-channel Source 1/2 rule, since `NEXT100EVT` is always that same
+block's own prefix — no complementary-channel scenario to reconcile). Part E's
+example-read selection specifically works around one consequence of that rule:
+a read's ALLAFTERM-length-winning block is not guaranteed to be the block that
+happens to carry Source 1 signal, so example traces for Source-1-bearing reads
+use that read's Source-1-bearing block specifically, not blindly the winner.
+
+Six groups of output, all in
+`Eylul_gem_data/slurm_full_run_allafterm/figures_allafterm/`:
+- **A — HMM-Match-anchored median±IQR**: first 100 events (from `NEXT100EVT`)
+  and first 500 (from `ALLAFTERM`), each with a lower panel of unique-read
+  coverage vs. x and a companion TSV (x, sample, n, median, Q1, Q3).
+- **B — physical-end-anchored median±IQR**: last 100/500/3000 detected events
+  (reversed `ALLAFTERM`, x=0 = final detected event), same panel/TSV structure.
+- **C — read-level boxplots**: median/mean/std/slope-vs-event-number/fraction
+  above +1/fraction below −1, over the first 25/50/100 post-Match events, plus
+  a focused single boxplot of the first-100 median (the `ALLAFTERM` analogue
+  of `tail_end_3000_median_boxplot.png`).
+- **D — remaining-length distribution**: histogram, log-scaled histogram,
+  ECDF, box/violin of `ALLAFTERM` event count per unique read.
+- **E — individual traces**: first 500 `ALLAFTERM` events for ≥10 gem + ≥10
+  control reads (fixed seed 0), every Source-1-bearing read force-included.
+  x=0 marked as the final HMM Match (true by construction). The Source
+  1/Source 2 boundary is **deliberately not marked** — Source 1/2 are
+  raw-sample-granularity and `ALLAFTERM` is event-mean-granularity, and the
+  per-event raw-sample count needed to convert between them is not
+  recoverable from this output at all, so estimating that boundary on the
+  plot would be fabricating precision the data doesn't support. States this
+  explicitly rather than guessing.
+- **F — full, untruncated `ALLAFTERM`** (added 2026-07-15, follow-up request):
+  no 100/500/3000-event cap anywhere. Per-read mean and median over the
+  **entire** `ALLAFTERM` array (`allafterm_full_read_mean_median_boxplots.png`,
+  one value per unique read regardless of tail length — a 725,085-event read
+  and a 1,042-event read each contribute exactly one point), and a
+  median±IQR trace from x=1 through whichever read goes furthest in either
+  sample (`allafterm_hmm_anchored_full_trace.png` + a log-x version, since
+  the ~700x span between shortest and longest reads makes the linear version
+  unreadable in the informative sub-10,000-event region — both retain the
+  complete range, log-x is a different axis scale, not a truncation), with a
+  coverage subpanel and explicit 50/25/10/5%-of-starting-count crossing
+  markers so a viewer can't mistake a thinly-covered tail for a well-covered
+  one. Hit and worked around a genuine `matplotlib`/Agg rendering limit
+  (`OverflowError: In draw_markers: Exceeded cell block limit` on a
+  ~725,085-vertex polygon) with display-only stride decimation — the
+  companion TSV (`allafterm_hmm_anchored_full_trace.tsv`, 736,584 rows) is
+  never decimated and keeps full per-event resolution. Full detail in
+  `TAIL_SIGNAL_CAPTURE.md` §10's Part F addendum.
+
+Counts (full canonical run): 50 gem / 321 control unique reads (347 blocks,
+26 collisions — cross-checked: C++'s independently-computed unique-read-ID
+count and the plotting script's independent dedup both landed on 321 for
+control). `ALLAFTERM` totals 212,484 events (gem) / 2,476,953 events
+(control); events per alignment block range 1,134–11,499 (gem) /
+1,042–725,085 (control) — see `TAIL_SIGNAL_CAPTURE.md` §10 for the full table.
+
+**Scientific limitations, restated for this specific analysis**: sample sizes
+remain modest and asymmetric (50 gem vs. 321 control); event-index positions
+are not base positions; sequencing/prep differences between the gem and
+control BAMs (already flagged in §4.4/`TAIL_SIGNAL_CAPTURE.md` as an
+unexplained qualifying-rate asymmetry) could in principle produce systematic
+signal differences unrelated to gemcitabine chemistry, and this analysis
+cannot distinguish that from a genuine gemcitabine-specific effect. See the
+closing discussion below (and the conversation this document accompanies) for
+whether the observed post-Match differences are visually apparent and whether
+they hold up under an actual read-level statistical check, rather than being
+read off IQR-band overlap.
 
 ---
 
@@ -802,7 +940,8 @@ instead) are in `TAIL_SIGNAL_CAPTURE.md` §9.
 | What was changed to recover signal past position 611 (up to and including 614), and why? | §4 above |
 | Exact build steps, full-dataset run status/job IDs, output file paths, output line format, parsing examples, qualifying-read definition, and all known caveats/limitations for the tail-capture output | `TAIL_SIGNAL_CAPTURE.md` (§§3-4, 8-9) |
 | What is `--tail-source`/`TAIL_SOURCE1`/`TAIL_SOURCE2`, and why a third `NEXT100EVT` pool exists (the PI's proposed `eventIndeces`/`lastMatchRawIdx` anchor) | §4.4-4.6 above; `TAIL_SIGNAL_CAPTURE.md` §§8-9 |
-| How to plot/re-plot the tail-capture results | Cutoff-anchored: `TAIL_SIGNAL_CAPTURE.md` §6, `Eylul_gem_data/scripts/plot_tail_signal.py`. End-anchored, read-deduplicated (the more biologically relevant view, since Gem is expected right at the physical 3' end): `TAIL_SIGNAL_CAPTURE.md` §7, `Eylul_gem_data/scripts/plot_tail_signal_end_focused.py` |
+| How to plot/re-plot the tail-capture results | Cutoff-anchored: `TAIL_SIGNAL_CAPTURE.md` §6, `Eylul_gem_data/scripts/plot_tail_signal.py`. End-anchored, read-deduplicated (the more biologically relevant view, since Gem is expected right at the physical 3' end): `TAIL_SIGNAL_CAPTURE.md` §7, `Eylul_gem_data/scripts/plot_tail_signal_end_focused.py`. Event-count-anchored, uncapped (`ALLAFTERM`/`NEXT100EVT`), with read-level statistics: `TAIL_SIGNAL_CAPTURE.md` §10, `Eylul_gem_data/scripts/plot_allafterm_analysis.py` |
+| What is `ALLAFTERM`, how does it relate to `NEXT100EVT`, and is the post-Match signal actually different gem vs control at the read level | §4.7 above; `TAIL_SIGNAL_CAPTURE.md` §10 |
 | Recommended next analytical steps | `TAIL_SIGNAL_CAPTURE.md` §5 (changepoint analysis on the tail, investigating the ~98% 3' soft-clip rate, revisiting the qualifying-rate asymmetry noted independently in both §2.2 above and there) |
 
 **Headline status as of the full SLURM runs**: 50/3488 gem reads (~1.4%) and
@@ -817,3 +956,24 @@ result in the analyzable region, no dramatic separation has emerged yet, though
 some local divergence exists that's better suited to a proper changepoint
 analysis than to reading the plot by eye (see `TAIL_SIGNAL_CAPTURE.md` §5-7 for
 specifics and the actual figures).
+
+**Update (2026-07-15, `ALLAFTERM` read-level analysis, §4.7)**: pooled-event
+median±IQR bands still show substantial overlap, consistent with the above —
+but an explicit **read-level** statistical check (Mann-Whitney U on each
+read's own summary statistic, not eyeballing band overlap) over the first 100
+post-Match events finds a modest, direction-consistent difference: control
+reads trend more negative than gem reads as the window grows from 25→50→100
+events (read-level mean p≈0.012, slope-vs-event-number p≈0.0015, fraction of
+events below −1 p≈0.0046; the median itself is only borderline at p≈0.062).
+This pattern **survives trimming the 3 most extreme reads per group** (p gets
+tighter, not weaker, after trimming) — so it is not obviously an artifact of
+a few outlier reads — but effect size is modest (common-language/AUC≈0.58,
+i.e. a randomly picked gem read's value exceeds a randomly picked control
+read's about 58% of the time, not a clean separation), no correction for the
+~15 metric/window combinations tested was applied, and — critically — this
+region is entirely past the reference-anchored, HMM-modelled part of the read,
+so a real, reproducible difference here would still need to be distinguished
+from a systematic gem-vs-control library-prep effect (the same open question
+already flagged for the qualifying-rate asymmetry) before attributing it to
+gemcitabine specifically. Treat as a hypothesis worth a proper follow-up, not
+a conclusion.

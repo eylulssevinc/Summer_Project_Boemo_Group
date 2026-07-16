@@ -28,6 +28,7 @@
 #include "config.h"
 #include <mutex>
 #include <algorithm>
+#include <set>
 
 static const char *help=
 "align: DNAscent executable that generates a BrdU- and EdU-aware event alignment.\n"
@@ -189,17 +190,18 @@ Arguments parseAlignArguments( int argc, char** argv ){
 }
 
 
-//counts how many TAIL_SOURCE1/TAIL_SOURCE2/NEXT100EVT lines eventalign() appended to one
-//read's output block - used only for the --tail-source terminal summary in align_main.
-//This necessarily reflects what the current --tail-source mode actually captured/printed
-//for this run, not what signal exists in principle (e.g. under --tail-source source1, a
-//read's Source 2 count here will always read zero even if that read has real Source 2
-//signal, because it was never collected this run).
-void countTailLines(const std::string &out, long &n1, long &n2, long &n3){
+//counts how many TAIL_SOURCE1/TAIL_SOURCE2/NEXT100EVT/ALLAFTERM lines eventalign()
+//appended to one read's output block - used only for the --tail-source terminal
+//summary in align_main. This necessarily reflects what the current --tail-source mode
+//actually captured/printed for this run, not what signal exists in principle (e.g.
+//under --tail-source source1, a read's Source 2 count here will always read zero even
+//if that read has real Source 2 signal, because it was never collected this run).
+void countTailLines(const std::string &out, long &n1, long &n2, long &n3, long &n4){
 
 	n1 = 0;
 	n2 = 0;
 	n3 = 0;
+	n4 = 0;
 	size_t pos = 0;
 	while ( (pos = out.find('\n', pos)) != std::string::npos ){
 
@@ -207,6 +209,7 @@ void countTailLines(const std::string &out, long &n1, long &n2, long &n3){
 		if (out.compare(lineStart, 12, "TAIL_SOURCE1") == 0) n1++;
 		else if (out.compare(lineStart, 12, "TAIL_SOURCE2") == 0) n2++;
 		else if (out.compare(lineStart, 10, "NEXT100EVT") == 0) n3++;
+		else if (out.compare(lineStart, 9, "ALLAFTERM") == 0) n4++;
 		pos = lineStart;
 	}
 }
@@ -247,10 +250,13 @@ void printTailLengthSummary(const std::string &label, std::vector<long> lengths)
 //normal end-of-BAM return) so the summary always prints regardless of which one is hit.
 void printTailCaptureSummary(TailCaptureMode mode, long readsPassingTailGate,
                               long readsWithSource1, long readsWithSource2, long readsWithNext100,
+                              long readsWithAllAfterM, long uniqueReadsWithAllAfterM,
                               long totalSource1Samples, long totalSource2Samples, long totalNext100Samples,
+                              long totalAllAfterMEvents,
                               const std::vector<long> &source1Lengths,
                               const std::vector<long> &source2Lengths,
-                              const std::vector<long> &next100Lengths){
+                              const std::vector<long> &next100Lengths,
+                              const std::vector<long> &allAfterMLengths){
 
 	std::cout << std::endl << "Tail-source capture summary (--tail-source "
 	          << tailCaptureModeToString(mode) << "):" << std::endl;
@@ -262,9 +268,13 @@ void printTailCaptureSummary(TailCaptureMode mode, long readsPassingTailGate,
 	          << ", total Source 2 samples: " << totalSource2Samples << std::endl;
 	std::cout << "  reads with NEXT100EVT signal printed this run: " << readsWithNext100
 	          << ", total NEXT100EVT samples (event-mean granularity, <=100 events/read): " << totalNext100Samples << std::endl;
+	std::cout << "  alignment blocks with ALLAFTERM signal printed this run: " << readsWithAllAfterM
+	          << " (" << uniqueReadsWithAllAfterM << " unique read IDs)"
+	          << ", total ALLAFTERM events (event-mean granularity, uncapped): " << totalAllAfterMEvents << std::endl;
 	printTailLengthSummary("Source 1 tail length per read", source1Lengths);
 	printTailLengthSummary("Source 2 tail length per read", source2Lengths);
 	printTailLengthSummary("NEXT100EVT tail length per read", next100Lengths);
+	printTailLengthSummary("ALLAFTERM events per alignment block", allAfterMLengths);
 }
 
 
@@ -983,6 +993,28 @@ void eventalign( DNAscent::read &r, unsigned int totalWindowLength, TailCaptureM
 		}
 	}
 
+	//ALLAFTERM: every valid event in r.events after lastMatchRawIdx, uncapped - the full
+	//pool NEXT100EVT is a fixed-width prefix of. Same anchor, same event-mean granularity,
+	//same guard/scaling, just no +100 cap. Guarded explicitly on `lastMatchRawIdx <
+	//r.events.size()` (not just `haveLastMatchRawIdx`) so a malformed/zero-length
+	//r.events can never be indexed and `lastMatchRawIdx + 1` can never be computed from
+	//an out-of-range value - the for-loop bound (`evi < r.events.size()`) on its own
+	//already makes an empty r.events or an already-at-the-end lastMatchRawIdx a
+	//zero-iteration no-op, but the extra guard makes that invariant explicit rather than
+	//relying on unsigned wraparound never occurring.
+	std::vector<double> tailSignalAllAfterM;
+	if ( (wantSource1 or wantSource2) and haveLastMatchRawIdx and lastMatchRawIdx < r.events.size() ){
+
+		for ( size_t evi = lastMatchRawIdx + 1; evi < r.events.size(); evi++ ){
+
+			double event_mean = r.events[evi].mean;
+			if ( not (0. < event_mean and event_mean < 250.) ) continue; //same signal guard used elsewhere
+
+			double scaledEvent = (event_mean - r.scalings.shift) / r.scalings.scale;
+			tailSignalAllAfterM.push_back(scaledEvent);
+		}
+	}
+
 	//Each buffer is independently in chronological order. No reference coordinate is
 	//meaningful for either source, so lines lead with a non-numeric marker (existing parsers
 	//that blindly do int(fields[0]) on every line need to skip these first). wantSource1/
@@ -1006,6 +1038,15 @@ void eventalign( DNAscent::read &r, unsigned int totalWindowLength, TailCaptureM
 	if (wantSource1 or wantSource2){
 		for ( size_t i = 0; i < tailSignalNext100Events.size(); i++ ){
 			r.humanReadable_eventalignOut += "NEXT100EVT\t" + std::to_string(i) + "\t" + std::to_string(tailSignalNext100Events[i]) + "\n";
+		}
+	}
+	//ALLAFTERM deliberately does not start with "TAIL" either, for the same reason
+	//NEXT100EVT doesn't (see the comment above) - and by construction, tailSignalNext100Events
+	//is exactly tailSignalAllAfterM's first min(100, size) entries (same anchor, same guard,
+	//same scaling, same iteration order), so NEXT100EVT never needs re-deriving from this.
+	if (wantSource1 or wantSource2){
+		for ( size_t i = 0; i < tailSignalAllAfterM.size(); i++ ){
+			r.humanReadable_eventalignOut += "ALLAFTERM\t" + std::to_string(i) + "\t" + std::to_string(tailSignalAllAfterM[i]) + "\n";
 		}
 	}
 
@@ -1062,9 +1103,16 @@ int align_main( int argc, char** argv ){
 	//accumulated only inside the #pragma omp critical block below, alongside the existing
 	//outFile/prog/pb updates - see the terminal summary printed at the end of this function.
 	long readsPassingTailGate = 0;
-	long readsWithSource1 = 0, readsWithSource2 = 0, readsWithNext100 = 0;
-	long totalSource1Samples = 0, totalSource2Samples = 0, totalNext100Samples = 0;
-	std::vector<long> source1Lengths, source2Lengths, next100Lengths;
+	long readsWithSource1 = 0, readsWithSource2 = 0, readsWithNext100 = 0, readsWithAllAfterM = 0;
+	long totalSource1Samples = 0, totalSource2Samples = 0, totalNext100Samples = 0, totalAllAfterMEvents = 0;
+	std::vector<long> source1Lengths, source2Lengths, next100Lengths, allAfterMLengths;
+	//ALLAFTERM's alignment-block count above (readsWithAllAfterM) can double-count a
+	//physical read that produced more than one qualifying BAM record/block against this
+	//reference (documented in TAIL_SIGNAL_CAPTURE.md's dedup notes) - this set tracks the
+	//unique read_id's instead, since r.readID is available here and ALLAFTERM's per-run
+	//summary is exactly where that distinction matters most (its length distribution is
+	//dominated by whichever mechanism produced the longest post-Match remainder).
+	std::set<std::string> uniqueReadIDsWithAllAfterM;
 
 	unsigned int maxBufferSize;
 	std::vector< bam1_t * > buffer;
@@ -1181,8 +1229,8 @@ int align_main( int argc, char** argv ){
 					if (readPassesTailGate){
 
 						readsPassingTailGate++;
-						long n1 = 0, n2 = 0, n3 = 0;
-						countTailLines(r.humanReadable_eventalignOut, n1, n2, n3);
+						long n1 = 0, n2 = 0, n3 = 0, n4 = 0;
+						countTailLines(r.humanReadable_eventalignOut, n1, n2, n3, n4);
 						if (n1 > 0){
 							readsWithSource1++;
 							totalSource1Samples += n1;
@@ -1198,6 +1246,12 @@ int align_main( int argc, char** argv ){
 							totalNext100Samples += n3;
 							next100Lengths.push_back(n3);
 						}
+						if (n4 > 0){
+							readsWithAllAfterM++;
+							totalAllAfterMEvents += n4;
+							allAfterMLengths.push_back(n4);
+							uniqueReadIDsWithAllAfterM.insert(r.readID);
+						}
 					}
 				}
 			}
@@ -1209,9 +1263,10 @@ int align_main( int argc, char** argv ){
 			bam_hdr_destroy(bam_hdr);
 			hts_close(bam_fh);
 			printTailCaptureSummary(args.tailSourceMode, readsPassingTailGate, readsWithSource1,
-			                        readsWithSource2, readsWithNext100, totalSource1Samples,
-			                        totalSource2Samples, totalNext100Samples,
-			                        source1Lengths, source2Lengths, next100Lengths);
+			                        readsWithSource2, readsWithNext100, readsWithAllAfterM,
+			                        (long) uniqueReadIDsWithAllAfterM.size(), totalSource1Samples,
+			                        totalSource2Samples, totalNext100Samples, totalAllAfterMEvents,
+			                        source1Lengths, source2Lengths, next100Lengths, allAfterMLengths);
 			return 0;
 		}
 	}
@@ -1222,8 +1277,9 @@ int align_main( int argc, char** argv ){
 	pod5_terminate();
 	logfile.close();
 	printTailCaptureSummary(args.tailSourceMode, readsPassingTailGate, readsWithSource1,
-	                        readsWithSource2, readsWithNext100, totalSource1Samples,
-	                        totalSource2Samples, totalNext100Samples,
-	                        source1Lengths, source2Lengths, next100Lengths);
+	                        readsWithSource2, readsWithNext100, readsWithAllAfterM,
+	                        (long) uniqueReadIDsWithAllAfterM.size(), totalSource1Samples,
+	                        totalSource2Samples, totalNext100Samples, totalAllAfterMEvents,
+	                        source1Lengths, source2Lengths, next100Lengths, allAfterMLengths);
 	return 0;
 }
